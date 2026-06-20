@@ -1,0 +1,5 @@
+{
+  "base_url": "http://your-ani-rss-host:7789",
+  "api_key_file": "./ani-rss-key.txt",
+  "api_key": ""
+}

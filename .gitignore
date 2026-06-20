@@ -1,0 +1,16 @@
+ani-rss-key.txt
+ani-rss-config.local.json
+.env
+.env.*
+*.local.json
+ani-rss-plan*.json
+ani-rss-selected*.json
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.trellis/
+.agents/
+.codex/
+AGENTS.md
+ani-rss-auto-subscribe/
+*.zip
