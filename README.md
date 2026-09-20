@@ -11,6 +11,9 @@
 - 输出字幕组、RSS、tags、样例标题等原始证据，让 LLM 判断字幕语言和规格。
 - 对样例标题做合集/整季包检测，提前暴露 ANI-RSS 可能无法按单集解析的风险。
 - 通过 `POST /api/rssToAni` 把用户确认的 RSS 转成 ANI-RSS 订阅对象。
+- 通过 `patch` 命令修改匹配/排除正则、备用 RSS、日期、季度、集数偏移和总集数等 Ani 字段。
+- 通过 `tmdb-lookup`、`tmdb-groups` 暴露 TMDB 原始数据，由 LLM 按工作流确认季度和集数对齐，不在脚本里猜测。
+- 通过 `preview` 在真正添加前检查修改后的 Ani 对象。
 - 只有在显式传入 `--confirm-add` 时，才会通过 `POST /api/addAni` 真正添加订阅。
 
 ## 项目结构
@@ -23,6 +26,10 @@ ani-rss-auto-subscribe/
     ani_rss.py
   references/
     ani-rss-api.md
+    tmdb-alignment.md
+  ani-rss-patch.example.json
+  tests/
+    test_ani_rss.py
   .gitignore
 ```
 
@@ -119,13 +126,52 @@ python scripts/ani_rss.py build-from-rss \
   --subgroup "沸班亚马制作组" > ani-rss-selected.local.json
 ```
 
+如果需要修改 ANI-RSS 的匹配规则、日期或集数信息，先复制示例 patch，再按证据编辑：
+
+```powershell
+Copy-Item ani-rss-patch.example.json ani-rss-patch.local.json
+python scripts/ani_rss.py patch `
+  --ani-json ani-rss-selected.local.json `
+  --patch-json ani-rss-patch.local.json > ani-rss-patched.local.json
+```
+
+`patch` 不替 LLM 解释正则，也不自动猜 TMDB 季数。`match`/`exclude` 是过滤规则；`customEpisodeStr` 才是集数提取规则。普通新增规则应使用 `appendMatch` / `appendExclude`，它们会追加到当前规则之后；`match` / `exclude` 才是整组替换。原始正则（如 `简繁日|简日`）匹配所有字幕组；只限定一个字幕组时使用 `{{字幕组名}}:正则`（如 `{{绿茶字幕组}}:简繁日|简日`）。界面里的空字幕组就是原始正则，不能写成 `{{}}:...`。这样会保留 ANI-RSS 已有的默认排除，如 `720[Pp]`、`\d-\d`、`合集`、`特别篇`，并把新增项置于它们之后。全局排除属于 ANI-RSS 实例配置，本脚本不读取或修改它；只有用户明确要求时才应在 Web UI 中单独处理。只有用户明确要求备用 RSS 时，才可写入 `standbyRssList`；每项必须有 `url` 和 `offset`，且备用源必须覆盖同一内容范围。不同编号方式允许存在，但要单独计算 offset；ANI-RSS 全局的备用 RSS 开关也必须开启。
+
+TMDB 对齐使用只读接口：
+
+```powershell
+python scripts/ani_rss.py tmdb-lookup --title "超超超超超喜欢你的100个女朋友"
+python scripts/ani_rss.py tmdb-groups --ani-json ani-rss-selected.local.json
+```
+
+这些命令只返回 TMDB 原始证据。LLM 需要先确认标题、年份、类型和季度对应的是同一部作品，再判断 RSS 是季度内编号还是连续编号，并确认 TMDB 剧集组使用季内编号还是全局编号。公式是 `目标集数 = RSS解析集数 + offset`：例如 RSS `S3E01` 对应合并单季的 TMDB `S1E25` 时使用 `offset: 24`；如果 TMDB 有独立第四季，RSS `S4E11` 则使用 `season: 4, offset: 0`；只有全局 `E77` 映射到独立 `S4E11` 时才使用 `offset: -66`。必须用 preview 返回的实际解析集数验证至少两个样本；双编号标题如 `[11 - 总第77]` 还需用 `customEpisodeStr` 捕获 `11`。无法确认编号模式、TMDB 剧集组或已有订阅时，必须询问用户。
+
+修改后先预览：
+
+```powershell
+python scripts/ani_rss.py preview --ani-json ani-rss-patched.local.json
+```
+
 最终添加订阅：
 
 ```bash
-python scripts/ani_rss.py add --ani-json ani-rss-selected.local.json --confirm-add
+python scripts/ani_rss.py add --ani-json ani-rss-patched.local.json --confirm-add
 ```
 
 如果不传 `--confirm-add`，`add` 命令会拒绝调用 ANI-RSS，不会添加订阅。
+
+编辑已有订阅时，不能调用 `add`。先读取完整对象、patch 并 preview，用户确认后再提交：
+
+```powershell
+python scripts/ani_rss.py get --id "<existing-ani-id>" > ani-rss-existing.local.json
+python scripts/ani_rss.py patch `
+  --ani-json ani-rss-existing.local.json `
+  --patch-json ani-rss-patch.local.json > ani-rss-patched.local.json
+python scripts/ani_rss.py preview --ani-json ani-rss-patched.local.json
+python scripts/ani_rss.py set --ani-json ani-rss-patched.local.json --confirm-set
+```
+
+`set` 默认不移动文件；只有用户明确要求移动文件时才增加 `--move-files`。
 
 ## 不存在和多匹配场景
 
@@ -225,7 +271,9 @@ Agent 应以 `SKILL.md` 作为主要操作说明。正常流程是：
 3. 如果有多个候选，让用户确认番剧。
 4. 让用户确认字幕组、语言/规格和 RSS 源。
 5. 运行 `build-from-rss`。
-6. 在用户确认后运行 `add --confirm-add`。
+6. 运行 `tmdb-lookup`/`tmdb-groups`，按 `references/tmdb-alignment.md` 比较 RSS 与 TMDB 的季度、集数和日期。
+7. 必要时生成最小 patch，运行 `patch` 和 `preview`，向用户展示旧值、新值和证据。
+8. 新订阅在用户确认整个修改结果后运行 `add --confirm-add`；已有订阅使用 `get` → `patch` → `preview` → `set --confirm-set`。
 
 ## 安全规则
 
@@ -233,4 +281,5 @@ Agent 应以 `SKILL.md` 作为主要操作说明。正常流程是：
 - 不要在聊天或日志里打印 API Key。
 - 不要内置 ANI-RSS endpoint。
 - 默认只使用 Mikan 流程，不默认调用 BGM 端点。
+- 不要主动建议或添加备用 RSS；仅在用户明确要求时才处理。
 - 不要在测试中运行 `add --confirm-add`，除非你确实想修改 ANI-RSS 实例。

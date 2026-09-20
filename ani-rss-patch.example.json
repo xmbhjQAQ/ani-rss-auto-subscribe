@@ -1,0 +1,12 @@
+{
+  "appendMatch": [
+    "{{绿茶字幕组}}:简繁日|简日"
+  ],
+  "appendExclude": [
+    "{{绿茶字幕组}}:预告"
+  ],
+  "releaseDate": "2026-07-05",
+  "season": 1,
+  "offset": 0,
+  "totalEpisodeNumber": 13
+}

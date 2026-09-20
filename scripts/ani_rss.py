@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import datetime as dt
 import json
 import os
 import re
@@ -19,6 +21,23 @@ LOCAL_KEY_FILE = "ani-rss-key.txt"
 LOCAL_CONFIG_FILE = "ani-rss-config.local.json"
 DEFAULT_TIMEOUT = 60
 EPISODE_RANGE_LIMIT = 200
+PATCHABLE_ANI_FIELDS = {
+    "match",
+    "exclude",
+    "appendMatch",
+    "appendExclude",
+    "standbyRssList",
+    "releaseDate",
+    "season",
+    "offset",
+    "totalEpisodeNumber",
+    "customEpisode",
+    "customEpisodeStr",
+    "customEpisodeGroupIndex",
+    "tmdb",
+    "themoviedbName",
+}
+STANDBY_RSS_FIELDS = {"label", "url", "offset"}
 BATCH_KEYWORD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("keyword:合集", re.compile(r"合集")),
     ("keyword:全集", re.compile(r"全集")),
@@ -524,6 +543,286 @@ def extract_ani_payload(value: Any) -> Any:
     return value
 
 
+def read_object_arg(value: str, label: str) -> dict[str, Any]:
+    parsed = read_json_arg(value)
+    if not isinstance(parsed, dict):
+        raise AniRssError(f"{label} must contain a JSON object")
+    return parsed
+
+
+def validate_regex_array(value: Any, field: str) -> None:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise AniRssError(f"{field} must be a JSON array of strings")
+
+
+def validate_patch(patch: dict[str, Any]) -> dict[str, Any]:
+    unknown = set(patch) - PATCHABLE_ANI_FIELDS
+    if unknown:
+        raise AniRssError(
+            "Unsupported Ani patch fields: " + ", ".join(sorted(unknown))
+        )
+
+    for field in ("match", "exclude", "appendMatch", "appendExclude"):
+        if field not in patch:
+            continue
+        validate_regex_array(patch[field], field)
+
+    if "match" in patch and "appendMatch" in patch:
+        raise AniRssError("Use either match or appendMatch, not both")
+    if "exclude" in patch and "appendExclude" in patch:
+        raise AniRssError("Use either exclude or appendExclude, not both")
+
+    if "standbyRssList" in patch:
+        standby = patch["standbyRssList"]
+        if not isinstance(standby, list):
+            raise AniRssError("standbyRssList must be a JSON array")
+        for item in standby:
+            if not isinstance(item, dict):
+                raise AniRssError("standbyRssList entries must be JSON objects")
+            unknown_standby_fields = set(item) - STANDBY_RSS_FIELDS
+            if unknown_standby_fields:
+                raise AniRssError(
+                    "Unsupported standbyRssList fields: "
+                    + ", ".join(sorted(unknown_standby_fields))
+                )
+            if "label" in item and not isinstance(item["label"], str):
+                raise AniRssError("standbyRssList label must be a string")
+            if not isinstance(item.get("url"), str) or not item["url"].strip():
+                raise AniRssError("standbyRssList url must be a non-empty string")
+            if (
+                "offset" not in item
+                or not isinstance(item["offset"], int)
+                or isinstance(item["offset"], bool)
+            ):
+                raise AniRssError("standbyRssList offset must be an integer")
+
+    if "releaseDate" in patch:
+        release_date = patch["releaseDate"]
+        if not isinstance(release_date, str) or not re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}", release_date
+        ):
+            raise AniRssError("releaseDate must be a YYYY-MM-DD string")
+        try:
+            dt.date.fromisoformat(release_date)
+        except ValueError as exc:
+            raise AniRssError("releaseDate must be a YYYY-MM-DD string") from exc
+
+    for field in ("season", "offset", "totalEpisodeNumber", "customEpisodeGroupIndex"):
+        if field not in patch:
+            continue
+        if not isinstance(patch[field], int) or isinstance(patch[field], bool):
+            raise AniRssError(f"{field} must be an integer")
+        if field in {"season", "totalEpisodeNumber", "customEpisodeGroupIndex"} and patch[field] < 0:
+            raise AniRssError(f"{field} must not be negative")
+
+    if "customEpisode" in patch and not isinstance(patch["customEpisode"], bool):
+        raise AniRssError("customEpisode must be a boolean")
+    if "customEpisodeStr" in patch and (
+        not isinstance(patch["customEpisodeStr"], str)
+        or not patch["customEpisodeStr"].strip()
+    ):
+        raise AniRssError("customEpisodeStr must be a string")
+    has_tmdb = "tmdb" in patch
+    has_tmdb_name = "themoviedbName" in patch
+    if has_tmdb != has_tmdb_name:
+        raise AniRssError("tmdb and themoviedbName must be patched together")
+    if has_tmdb:
+        tmdb = patch["tmdb"]
+        if not isinstance(tmdb, dict):
+            raise AniRssError("tmdb must be a JSON object")
+        for field in ("id", "tmdbType"):
+            if not isinstance(tmdb.get(field), str) or not tmdb[field].strip():
+                raise AniRssError(f"tmdb {field} must be a non-empty string")
+        if not any(
+            isinstance(tmdb.get(field), str) and tmdb[field].strip()
+            for field in ("name", "originalName")
+        ):
+            raise AniRssError("tmdb must include a non-empty name or originalName")
+    if "themoviedbName" in patch and not isinstance(patch["themoviedbName"], str):
+        raise AniRssError("themoviedbName must be a string")
+    return patch
+
+
+def validate_final_ani(ani: dict[str, Any]) -> None:
+    if not ani.get("customEpisode"):
+        return
+    pattern = ani.get("customEpisodeStr")
+    group_index = ani.get("customEpisodeGroupIndex")
+    if not isinstance(pattern, str) or not pattern.strip():
+        raise AniRssError(
+            "customEpisode=true requires a non-empty customEpisodeStr in the final Ani object"
+        )
+    if (
+        not isinstance(group_index, int)
+        or isinstance(group_index, bool)
+        or group_index < 0
+    ):
+        raise AniRssError(
+            "customEpisode=true requires a non-negative customEpisodeGroupIndex"
+        )
+
+
+def apply_patch(ani: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    validate_patch(patch)
+    patched = copy.deepcopy(ani)
+    field_changes = {
+        field: value
+        for field, value in patch.items()
+        if field not in {"appendMatch", "appendExclude"}
+    }
+    patched.update(copy.deepcopy(field_changes))
+    for patch_field, ani_field in (("appendMatch", "match"), ("appendExclude", "exclude")):
+        if patch_field not in patch:
+            continue
+        current = patched.get(ani_field, [])
+        validate_regex_array(current, f"existing Ani {ani_field}")
+        patched[ani_field] = copy.deepcopy(current) + copy.deepcopy(patch[patch_field])
+    validate_final_ani(patched)
+    return patched
+
+
+def command_patch(args: argparse.Namespace) -> None:
+    ani = extract_ani_payload(read_json_arg(args.ani_json))
+    if not isinstance(ani, dict):
+        raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
+    patch = read_object_arg(args.patch_json, "--patch-json")
+    patched = apply_patch(ani, patch)
+    print_json(
+        {
+            "ok": True,
+            "command": "patch",
+            "requires_user_confirmation": True,
+            "patch": patch,
+            "ani": patched,
+        }
+    )
+
+
+def command_preview(args: argparse.Namespace) -> None:
+    base_url, api_key = resolve_config(args)
+    ani = extract_ani_payload(read_json_arg(args.ani_json))
+    if not isinstance(ani, dict):
+        raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
+    response = request_json(
+        base_url,
+        api_key,
+        "POST",
+        "/api/previewAni",
+        body=ani,
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "preview",
+            "requires_user_confirmation": True,
+            "preview": unwrap_data(response),
+        }
+    )
+
+
+def command_tmdb_lookup(args: argparse.Namespace) -> None:
+    base_url, api_key = resolve_config(args)
+    body: dict[str, Any] = {"ova": args.movie}
+    if args.title:
+        body["title"] = args.title
+    if args.tmdb_id:
+        body["tmdbId"] = args.tmdb_id
+    response = request_json(
+        base_url,
+        api_key,
+        "POST",
+        "/api/getThemoviedbName",
+        body=body,
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "tmdb-lookup",
+            "query": body,
+            "result": unwrap_data(response),
+        }
+    )
+
+
+def command_tmdb_groups(args: argparse.Namespace) -> None:
+    base_url, api_key = resolve_config(args)
+    ani = extract_ani_payload(read_json_arg(args.ani_json))
+    if not isinstance(ani, dict):
+        raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
+    response = request_json(
+        base_url,
+        api_key,
+        "POST",
+        "/api/getThemoviedbGroup",
+        body=ani,
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "tmdb-groups",
+            "groups": unwrap_data(response),
+        }
+    )
+
+
+def flatten_subscriptions(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, dict):
+        return []
+    items: list[dict[str, Any]] = []
+    for week in ensure_list(value.get("weekList")):
+        if not isinstance(week, dict):
+            continue
+        items.extend(
+            item for item in ensure_list(week.get("items")) if isinstance(item, dict)
+        )
+    return items
+
+
+def command_get(args: argparse.Namespace) -> None:
+    base_url, api_key = resolve_config(args)
+    response = request_json(
+        base_url, api_key, "POST", "/api/listAni", timeout=args.timeout
+    )
+    for ani in flatten_subscriptions(unwrap_data(response)):
+        if ani.get("id") == args.id:
+            print_json({"ok": True, "command": "get", "ani": ani})
+            return
+    raise AniRssError(f"Subscription not found: {args.id}")
+
+
+def command_set(args: argparse.Namespace) -> None:
+    if not args.confirm_set:
+        fail("Refusing to call /api/setAni without --confirm-set.", exit_code=2)
+    base_url, api_key = resolve_config(args)
+    ani = extract_ani_payload(read_json_arg(args.ani_json))
+    if not isinstance(ani, dict):
+        raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
+    if not isinstance(ani.get("id"), str) or not ani["id"].strip():
+        raise AniRssError("/api/setAni requires an existing Ani object with a non-empty id")
+    response = request_json(
+        base_url,
+        api_key,
+        "POST",
+        "/api/setAni",
+        query={"move": "true"} if args.move_files else None,
+        body=ani,
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "set",
+            "move_files": args.move_files,
+            "response": response,
+        }
+    )
+
+
 def command_add(args: argparse.Namespace) -> None:
     if not args.confirm_add:
         fail("Refusing to call /api/addAni without --confirm-add.", exit_code=2)
@@ -596,6 +895,59 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--subgroup", required=True)
     build.add_argument("--disabled", action="store_true", help="Create Ani disabled")
     build.set_defaults(func=command_build_from_rss)
+
+    patch_cmd = subparsers.add_parser(
+        "patch", help="Apply validated field changes to an Ani JSON object"
+    )
+    patch_cmd.add_argument("--ani-json", required=True, help="Ani JSON path or '-' for stdin")
+    patch_cmd.add_argument(
+        "--patch-json", required=True, help="JSON object containing supported Ani field changes"
+    )
+    patch_cmd.set_defaults(func=command_patch)
+
+    preview = subparsers.add_parser(
+        "preview", help="Preview an Ani object without creating a subscription"
+    )
+    add_common_args(preview)
+    preview.add_argument("--ani-json", required=True, help="Ani JSON path or '-' for stdin")
+    preview.set_defaults(func=command_preview)
+
+    tmdb_lookup = subparsers.add_parser(
+        "tmdb-lookup", help="Read-only ANI-RSS TMDB lookup"
+    )
+    add_common_args(tmdb_lookup)
+    lookup = tmdb_lookup.add_mutually_exclusive_group(required=True)
+    lookup.add_argument("--title", help="Title to look up")
+    lookup.add_argument("--tmdb-id", help="Exact TMDB id to retrieve")
+    tmdb_lookup.add_argument(
+        "--movie", action="store_true", help="Use movie/OVA lookup instead of TV"
+    )
+    tmdb_lookup.set_defaults(func=command_tmdb_lookup)
+
+    tmdb_groups = subparsers.add_parser(
+        "tmdb-groups", help="Read-only ANI-RSS TMDB episode-group lookup"
+    )
+    add_common_args(tmdb_groups)
+    tmdb_groups.add_argument(
+        "--ani-json", required=True, help="Ani JSON path or '-' for stdin"
+    )
+    tmdb_groups.set_defaults(func=command_tmdb_groups)
+
+    get_cmd = subparsers.add_parser("get", help="Read one existing Ani subscription by id")
+    add_common_args(get_cmd)
+    get_cmd.add_argument("--id", required=True, help="Existing Ani subscription id")
+    get_cmd.set_defaults(func=command_get)
+
+    set_cmd = subparsers.add_parser("set", help="Persist edits to an existing Ani subscription")
+    add_common_args(set_cmd)
+    set_cmd.add_argument("--ani-json", required=True, help="Existing Ani JSON path or '-' for stdin")
+    set_cmd.add_argument("--confirm-set", action="store_true")
+    set_cmd.add_argument(
+        "--move-files",
+        action="store_true",
+        help="Allow ANI-RSS to move files when the download path changes",
+    )
+    set_cmd.set_defaults(func=command_set)
 
     add = subparsers.add_parser("add", help="Add an Ani subscription")
     add_common_args(add)
