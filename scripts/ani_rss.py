@@ -579,7 +579,29 @@ def read_object_arg(value: str, label: str) -> dict[str, Any]:
     return parsed
 
 
-def resolve_tmdb_credentials(args: argparse.Namespace) -> tuple[str, str | None, str | None]:
+def normalize_tmdb_proxy(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise AniRssError("tmdb_proxy must be a non-empty proxy URL or an empty string")
+    proxy_url = value.strip()
+    try:
+        parsed = urllib.parse.urlsplit(proxy_url)
+        port = parsed.port
+    except ValueError as exc:
+        raise AniRssError("tmdb_proxy contains an invalid port") from exc
+    if parsed.scheme.lower() != "http":
+        raise AniRssError("tmdb_proxy must use http")
+    if not parsed.hostname or port is None:
+        raise AniRssError("tmdb_proxy must include a host and port")
+    if parsed.path not in ("", "/") or parsed.query or parsed.fragment:
+        raise AniRssError("tmdb_proxy must not include a path, query, or fragment")
+    return proxy_url
+
+
+def resolve_tmdb_credentials(
+    args: argparse.Namespace,
+) -> tuple[str, str | None, str | None, str | None]:
     local_config = load_local_config()
     base_url = (
         getattr(args, "tmdb_base_url", None)
@@ -602,7 +624,25 @@ def resolve_tmdb_credentials(args: argparse.Namespace) -> tuple[str, str | None,
             "Missing TMDB credentials. Set TMDB_API_TOKEN (recommended) or TMDB_API_KEY, "
             "or configure tmdb_api_token/tmdb_api_key in ani-rss-config.local.json."
         )
-    return base_url, token, api_key
+    proxy_url = normalize_tmdb_proxy(local_config.get("tmdb_proxy"))
+    return base_url, token, api_key, proxy_url
+
+
+def read_tmdb_response(
+    req: urllib.request.Request,
+    *,
+    timeout: int,
+    proxy_url: str | None,
+) -> str:
+    if not proxy_url:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.read().decode("utf-8")
+
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+    )
+    with opener.open(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
 
 
 def request_tmdb_json(
@@ -612,6 +652,7 @@ def request_tmdb_json(
     path: str,
     *,
     query: dict[str, str] | None = None,
+    proxy_url: str | None = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> Any:
     url = f"{base_url}{path}"
@@ -625,8 +666,7 @@ def request_tmdb_json(
         url = f"{url}?{urllib.parse.urlencode(params)}"
     req = urllib.request.Request(url, headers=headers, method="GET")
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
+        raw = read_tmdb_response(req, timeout=timeout, proxy_url=proxy_url)
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise AniRssError(f"TMDB HTTP {exc.code}: {raw[:500]}") from exc
@@ -1051,12 +1091,13 @@ def preview_coverage(value: Any) -> dict[str, Any]:
 
 def command_tmdb_lookup(args: argparse.Namespace) -> None:
     if args.tmdb_id:
-        base_url, token, api_key = resolve_tmdb_credentials(args)
+        base_url, token, api_key, proxy_url = resolve_tmdb_credentials(args)
         result = request_tmdb_json(
             base_url,
             token,
             api_key,
             f"/{'movie' if args.movie else 'tv'}/{urllib.parse.quote(args.tmdb_id, safe='')}",
+            proxy_url=proxy_url,
             timeout=args.timeout,
         )
         print_json(
@@ -1096,7 +1137,7 @@ def command_tmdb_lookup(args: argparse.Namespace) -> None:
 def command_tmdb_season(args: argparse.Namespace) -> None:
     if args.season_number < 0:
         raise AniRssError("TMDB season number must not be negative")
-    base_url, token, api_key = resolve_tmdb_credentials(args)
+    base_url, token, api_key, proxy_url = resolve_tmdb_credentials(args)
     query = {"language": args.language} if args.language else None
     result = request_tmdb_json(
         base_url,
@@ -1104,6 +1145,7 @@ def command_tmdb_season(args: argparse.Namespace) -> None:
         api_key,
         f"/tv/{urllib.parse.quote(args.tmdb_id, safe='')}/season/{args.season_number}",
         query=query,
+        proxy_url=proxy_url,
         timeout=args.timeout,
     )
     print_json(
@@ -1122,12 +1164,13 @@ def command_tmdb_season(args: argparse.Namespace) -> None:
 
 
 def command_tmdb_group_details(args: argparse.Namespace) -> None:
-    base_url, token, api_key = resolve_tmdb_credentials(args)
+    base_url, token, api_key, proxy_url = resolve_tmdb_credentials(args)
     result = request_tmdb_json(
         base_url,
         token,
         api_key,
         f"/tv/episode_group/{urllib.parse.quote(args.group_id, safe='')}",
+        proxy_url=proxy_url,
         timeout=args.timeout,
     )
     print_json(

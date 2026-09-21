@@ -59,11 +59,18 @@ Copy-Item ani-rss-config.example.json ani-rss-config.local.json
 {
   "base_url": "http://your-ani-rss-host:7789",
   "api_key_file": "./ani-rss-key.txt",
-  "api_key": ""
+  "api_key": "",
+  "tmdb_proxy": ""
 }
 ```
 
 推荐把 API Key 放进 `ani-rss-key.txt`，然后在配置里使用 `api_key_file`。如果你只在本机使用，也可以直接把 API Key 写进 `api_key`，但不要提交 `ani-rss-config.local.json`。
+
+`tmdb_proxy` 只代理脚本直接访问 TMDB 的请求，不影响 ANI-RSS 或 Mikan。留空表示直连。使用 HTTP 代理，例如：
+
+- HTTP 示例：`"tmdb_proxy": "http://127.0.0.1:7890"`
+
+代理需要认证时可使用标准 URL 形式，例如 `http://user:password@proxy.example.com:7890`。无需安装额外依赖。
 
 脚本读取配置的优先级：
 

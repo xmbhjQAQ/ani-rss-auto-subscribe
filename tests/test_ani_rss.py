@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPT_PATH = Path(__file__).parents[1] / "scripts" / "ani_rss.py"
@@ -446,6 +446,69 @@ class AniAdapterTests(unittest.TestCase):
             ),
         )
 
+    def test_tmdb_proxy_config_accepts_http_urls(self):
+        self.assertEqual(
+            "http://127.0.0.1:7890",
+            ani_rss.normalize_tmdb_proxy(" http://127.0.0.1:7890 "),
+        )
+        for value in (
+            "ftp://proxy.test:21",
+            "https://proxy.test:8443",
+            "socks5://proxy.test:1080",
+            "http://proxy.test",
+            "http://proxy.test:80/path",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ani_rss.AniRssError):
+                    ani_rss.normalize_tmdb_proxy(value)
+
+    def test_tmdb_credentials_include_proxy_from_local_config(self):
+        args = SimpleNamespace(
+            tmdb_base_url=None,
+            tmdb_api_token=None,
+            tmdb_api_key=None,
+        )
+        with patch.object(
+            ani_rss,
+            "load_local_config",
+            return_value={
+                "tmdb_api_token": "token",
+                "tmdb_proxy": "http://127.0.0.1:7890",
+            },
+        ):
+            self.assertEqual(
+                (
+                    "https://api.themoviedb.org/3",
+                    "token",
+                    None,
+                    "http://127.0.0.1:7890",
+                ),
+                ani_rss.resolve_tmdb_credentials(args),
+            )
+
+    def test_http_tmdb_proxy_uses_a_dedicated_proxy_opener(self):
+        req = ani_rss.urllib.request.Request("https://api.themoviedb.org/3/tv/1")
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = b"{}"
+        with patch.object(
+            ani_rss.urllib.request, "build_opener", return_value=opener
+        ) as build_opener:
+            raw = ani_rss.read_tmdb_response(
+                req,
+                timeout=30,
+                proxy_url="http://127.0.0.1:7890",
+            )
+        self.assertEqual("{}", raw)
+        handler = build_opener.call_args.args[0]
+        self.assertEqual(
+            {
+                "http": "http://127.0.0.1:7890",
+                "https": "http://127.0.0.1:7890",
+            },
+            handler.proxies,
+        )
+        opener.open.assert_called_once_with(req, timeout=30)
+
     def test_tmdb_season_adapter_returns_raw_episode_evidence(self):
         args = SimpleNamespace(
             tmdb_id="123",
@@ -456,7 +519,7 @@ class AniAdapterTests(unittest.TestCase):
         with patch.object(
             ani_rss,
             "resolve_tmdb_credentials",
-            return_value=("https://tmdb.test/3", "token", None),
+            return_value=("https://tmdb.test/3", "token", None, None),
         ):
             with patch.object(
                 ani_rss,
@@ -472,6 +535,7 @@ class AniAdapterTests(unittest.TestCase):
             None,
             "/tv/123/season/2",
             query={"language": "zh-CN"},
+            proxy_url=None,
             timeout=30,
         )
         payload = json.loads(output.getvalue())
@@ -488,7 +552,7 @@ class AniAdapterTests(unittest.TestCase):
         with patch.object(
             ani_rss,
             "resolve_tmdb_credentials",
-            return_value=("https://tmdb.test/3", "token", None),
+            return_value=("https://tmdb.test/3", "token", None, None),
         ):
             with patch.object(
                 ani_rss,
@@ -503,6 +567,7 @@ class AniAdapterTests(unittest.TestCase):
             "token",
             None,
             "/tv/123",
+            proxy_url=None,
             timeout=30,
         )
         self.assertEqual("tmdb-api", json.loads(output.getvalue())["source"])
