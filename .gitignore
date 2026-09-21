@@ -14,3 +14,7 @@ __pycache__/
 AGENTS.md
 ani-rss-auto-subscribe/
 *.zip
+迁移/
+.ani-rss-runs/
+plan-output*.txt
+plan-result*.json

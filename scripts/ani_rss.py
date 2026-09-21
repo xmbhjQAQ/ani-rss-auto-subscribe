@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -21,6 +22,7 @@ LOCAL_KEY_FILE = "ani-rss-key.txt"
 LOCAL_CONFIG_FILE = "ani-rss-config.local.json"
 DEFAULT_TIMEOUT = 60
 EPISODE_RANGE_LIMIT = 200
+CURRENT_RESULT_FILE: Path | None = None
 PATCHABLE_ANI_FIELDS = {
     "match",
     "exclude",
@@ -72,12 +74,39 @@ class AniRssError(Exception):
 
 
 def fail(message: str, exit_code: int = 1) -> None:
-    print_json({"ok": False, "error": message})
+    print_json({"ok": False, "error": message, "exit_code": exit_code})
+    print(f"ANI-RSS error: {message}", file=sys.stderr, flush=True)
     raise SystemExit(exit_code)
 
 
 def print_json(value: Any) -> None:
-    print(json.dumps(value, ensure_ascii=True, indent=2))
+    rendered = json.dumps(value, ensure_ascii=True, indent=2)
+    print(rendered, flush=True)
+    if CURRENT_RESULT_FILE is None:
+        return
+    target = CURRENT_RESULT_FILE
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".tmp")
+        temporary.write_text(rendered + "\n", encoding="utf-8")
+        temporary.replace(target)
+    except OSError as exc:
+        print(
+            f"ANI-RSS result file write failed ({target}): {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+
+def json_sha256(value: Any) -> str:
+    """Return a stable digest for binding evidence to an exact JSON object."""
+    rendered = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
 
 
 def read_key_from_file(path: str) -> str:
@@ -550,6 +579,72 @@ def read_object_arg(value: str, label: str) -> dict[str, Any]:
     return parsed
 
 
+def resolve_tmdb_credentials(args: argparse.Namespace) -> tuple[str, str | None, str | None]:
+    local_config = load_local_config()
+    base_url = (
+        getattr(args, "tmdb_base_url", None)
+        or os.environ.get("TMDB_API_BASE_URL")
+        or local_config.get("tmdb_api_base_url")
+        or "https://api.themoviedb.org/3"
+    ).rstrip("/")
+    token = (
+        getattr(args, "tmdb_api_token", None)
+        or os.environ.get("TMDB_API_TOKEN")
+        or local_config.get("tmdb_api_token")
+    )
+    api_key = (
+        getattr(args, "tmdb_api_key", None)
+        or os.environ.get("TMDB_API_KEY")
+        or local_config.get("tmdb_api_key")
+    )
+    if not token and not api_key:
+        raise AniRssError(
+            "Missing TMDB credentials. Set TMDB_API_TOKEN (recommended) or TMDB_API_KEY, "
+            "or configure tmdb_api_token/tmdb_api_key in ani-rss-config.local.json."
+        )
+    return base_url, token, api_key
+
+
+def request_tmdb_json(
+    base_url: str,
+    token: str | None,
+    api_key: str | None,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Any:
+    url = f"{base_url}{path}"
+    params = dict(query or {})
+    headers = {"Accept": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    elif api_key:
+        params["api_key"] = api_key
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="replace")
+        raise AniRssError(f"TMDB HTTP {exc.code}: {raw[:500]}") from exc
+    except urllib.error.URLError as exc:
+        raise AniRssError(f"Cannot connect to TMDB at {base_url}: {exc}") from exc
+    except TimeoutError as exc:
+        raise AniRssError(f"TMDB request timed out after {timeout}s") from exc
+    try:
+        parsed = json.loads(raw) if raw else None
+    except json.JSONDecodeError as exc:
+        raise AniRssError(f"TMDB returned non-JSON response: {raw[:200]}") from exc
+    if isinstance(parsed, dict) and parsed.get("status_code") not in (None, 1):
+        raise AniRssError(
+            f"TMDB returned status_code={parsed.get('status_code')}: {parsed.get('status_message')}"
+        )
+    return parsed
+
+
 def validate_regex_array(value: Any, field: str) -> None:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise AniRssError(f"{field} must be a JSON array of strings")
@@ -662,6 +757,166 @@ def validate_final_ani(ani: dict[str, Any]) -> None:
         )
 
 
+def tmdb_id_from_ani(ani: dict[str, Any]) -> str | None:
+    tmdb = ani.get("tmdb")
+    if (
+        not isinstance(tmdb, dict)
+        or tmdb.get("id") in (None, "")
+        or not str(tmdb.get("id")).strip()
+    ):
+        return None
+    return str(tmdb["id"])
+
+
+def is_tv_ani(ani: dict[str, Any]) -> bool:
+    tmdb = ani.get("tmdb")
+    if isinstance(tmdb, dict):
+        tmdb_type = str(tmdb.get("tmdbType") or tmdb.get("media_type") or "").lower()
+        if tmdb_type in {"tv", "series", "tv series", "电视剧"}:
+            return True
+        if tmdb_type in {"movie", "film", "ova", "剧场版"}:
+            return False
+    return "season" in ani
+
+
+def tmdb_season_numbers(lookup_result: dict[str, Any]) -> set[int]:
+    """Return the season numbers advertised by a direct TMDB TV lookup."""
+    seasons = lookup_result.get("seasons")
+    if not isinstance(seasons, list):
+        return set()
+    numbers: set[int] = set()
+    for season in seasons:
+        if not isinstance(season, dict):
+            continue
+        value = season.get("season_number")
+        if isinstance(value, bool):
+            continue
+        try:
+            numbers.add(int(value))
+        except (TypeError, ValueError):
+            continue
+    return numbers
+
+
+def read_evidence_file(path: str, label: str) -> dict[str, Any]:
+    value = read_object_arg(path, label)
+    if value.get("ok") is False:
+        raise AniRssError(f"{label} contains an unsuccessful command result")
+    return value
+
+
+def validate_write_evidence(
+    ani: dict[str, Any],
+    *,
+    preview_path: str | None,
+    tmdb_lookup_path: str | None,
+    tmdb_season_path: str | None,
+) -> dict[str, Any]:
+    """Require read-only evidence before a mutating add/set call.
+
+    This deliberately validates identity and object binding only. The LLM still
+    decides semantic title/episode alignment from the raw evidence.
+    """
+    if not preview_path:
+        raise AniRssError(
+            "Refusing to write without --preview-evidence from the exact final Ani object."
+        )
+    preview_evidence = read_evidence_file(preview_path, "--preview-evidence")
+    if preview_evidence.get("command") != "preview":
+        raise AniRssError("--preview-evidence must contain a preview command result")
+    expected_hash = preview_evidence.get("input_sha256")
+    actual_hash = json_sha256(ani)
+    if expected_hash != actual_hash:
+        raise AniRssError(
+            "Preview evidence does not match the Ani object being written; run preview again."
+        )
+
+    tmdb_id = tmdb_id_from_ani(ani)
+    if not tmdb_id:
+        raise AniRssError(
+            "Refusing to write without a TMDB identity in the final Ani object."
+        )
+    if not tmdb_lookup_path:
+        raise AniRssError(
+            "Refusing to write without --tmdb-lookup-evidence from the exact TMDB id."
+        )
+    lookup_evidence = read_evidence_file(
+        tmdb_lookup_path, "--tmdb-lookup-evidence"
+    )
+    if lookup_evidence.get("command") != "tmdb-lookup":
+        raise AniRssError(
+            "--tmdb-lookup-evidence must contain a tmdb-lookup command result"
+        )
+    lookup_query = lookup_evidence.get("query")
+    if not isinstance(lookup_query, dict) or str(lookup_query.get("tmdb_id")) != tmdb_id:
+        raise AniRssError(
+            "TMDB lookup evidence does not match the final Ani TMDB id."
+        )
+    lookup_result = lookup_evidence.get("result")
+    if not isinstance(lookup_result, dict):
+        raise AniRssError("TMDB lookup evidence has no object result")
+    if lookup_result.get("id") in (None, ""):
+        raise AniRssError("TMDB lookup result has no id")
+    if str(lookup_result["id"]) != tmdb_id:
+        raise AniRssError("TMDB lookup result id does not match the final Ani TMDB id.")
+
+    season_evidence: dict[str, Any] | None = None
+    if is_tv_ani(ani):
+        if "season" not in ani or not isinstance(ani.get("season"), int):
+            raise AniRssError(
+                "TV subscriptions require a final integer season before writing."
+            )
+        advertised_seasons = tmdb_season_numbers(lookup_result)
+        if not advertised_seasons:
+            raise AniRssError(
+                "TMDB lookup evidence has no usable seasons list; inspect the direct "
+                "TMDB series result before selecting a TV season."
+            )
+        if ani["season"] not in advertised_seasons:
+            raise AniRssError(
+                "Final TMDB season is not present in the direct TMDB seasons list; "
+                "do not use the RSS season label as a TMDB season."
+            )
+        if not tmdb_season_path:
+            raise AniRssError(
+                "TV subscriptions require --tmdb-season-evidence from tmdb-season."
+            )
+        season_evidence = read_evidence_file(
+            tmdb_season_path, "--tmdb-season-evidence"
+        )
+        if season_evidence.get("command") != "tmdb-season":
+            raise AniRssError(
+                "--tmdb-season-evidence must contain a tmdb-season command result"
+            )
+        season_query = season_evidence.get("query")
+        if (
+            not isinstance(season_query, dict)
+            or str(season_query.get("tmdb_id")) != tmdb_id
+            or season_query.get("season_number") != ani.get("season")
+        ):
+            raise AniRssError(
+                "TMDB season evidence does not match the final Ani TMDB id/season."
+            )
+        season_result = season_evidence.get("result")
+        episodes = season_result.get("episodes") if isinstance(season_result, dict) else None
+        if not isinstance(episodes, list) or not episodes:
+            raise AniRssError(
+                "TMDB season evidence must contain a non-empty episode list."
+            )
+        if (
+            isinstance(season_result, dict)
+            and season_result.get("season_number") not in (None, ani.get("season"))
+        ):
+            raise AniRssError("TMDB season result number does not match the final Ani season.")
+
+    return {
+        "preview": preview_evidence,
+        "tmdb_lookup": lookup_evidence,
+        "tmdb_season": season_evidence,
+        "ani_sha256": actual_hash,
+    }
+
+
 def apply_patch(ani: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     validate_patch(patch)
     patched = copy.deepcopy(ani)
@@ -711,23 +966,115 @@ def command_preview(args: argparse.Namespace) -> None:
         body=ani,
         timeout=args.timeout,
     )
+    preview = unwrap_data(response)
     print_json(
         {
             "ok": True,
             "command": "preview",
+            "input_sha256": json_sha256(ani),
             "requires_user_confirmation": True,
-            "preview": unwrap_data(response),
+            "preview": preview,
+            "coverage": preview_coverage(preview),
         }
     )
 
 
+def preview_coverage(value: Any) -> dict[str, Any]:
+    items = value.get("items") if isinstance(value, dict) else None
+    items = [item for item in ensure_list(items) if isinstance(item, dict)]
+    parsed_items = [
+        item
+        for item in items
+        if isinstance(item.get("episode"), (int, float))
+        and not isinstance(item.get("episode"), bool)
+    ]
+    episode_values: list[float] = []
+    for item in parsed_items:
+        episode = item.get("episode")
+        episode_values.append(float(episode))
+    ordered = sorted(
+        parsed_items,
+        key=lambda item: float(item.get("episode")),
+    )
+    unique_episodes = sorted(set(episode_values))
+    duplicate_episodes = sorted(
+        episode for episode in set(episode_values) if episode_values.count(episode) > 1
+    )
+    missing_episodes: list[int] = []
+    if unique_episodes and all(episode.is_integer() for episode in unique_episodes):
+        low = int(unique_episodes[0])
+        high = int(unique_episodes[-1])
+        if high - low <= EPISODE_RANGE_LIMIT:
+            missing_episodes = [
+                episode
+                for episode in range(low, high + 1)
+                if float(episode) not in unique_episodes
+            ]
+
+    anchor_indices: list[int] = []
+    if ordered:
+        anchor_indices = [0, len(ordered) // 2, len(ordered) - 1]
+        anchor_indices = list(dict.fromkeys(anchor_indices))
+    anchors = [
+        {
+            "episode": item.get("episode"),
+            "title": item.get("title"),
+            "pub_date": item.get("pubDate"),
+        }
+        for index in anchor_indices
+        for item in [ordered[index]]
+    ]
+    return {
+        "returned_count": len(items),
+        "parsed_episode_count": len(episode_values),
+        "unparsed_item_count": len(items) - len(parsed_items),
+        "unique_episode_count": len(unique_episodes),
+        "episode_min": unique_episodes[0] if unique_episodes else None,
+        "episode_max": unique_episodes[-1] if unique_episodes else None,
+        "duplicate_episodes": duplicate_episodes,
+        "missing_episodes": missing_episodes,
+        "anchors": anchors,
+        "coverage_status": (
+            "no-items"
+            if not items
+            else "insufficient-samples"
+            if len(episode_values) < 3
+            else "observed-range"
+        ),
+        "full_feed_verified": False,
+        "note": (
+            "This describes returned preview items only. It does not prove that the RSS feed "
+            "contains the complete season; inspect the source range separately."
+        ),
+    }
+
+
 def command_tmdb_lookup(args: argparse.Namespace) -> None:
+    if args.tmdb_id:
+        base_url, token, api_key = resolve_tmdb_credentials(args)
+        result = request_tmdb_json(
+            base_url,
+            token,
+            api_key,
+            f"/{'movie' if args.movie else 'tv'}/{urllib.parse.quote(args.tmdb_id, safe='')}",
+            timeout=args.timeout,
+        )
+        print_json(
+            {
+                "ok": True,
+                "command": "tmdb-lookup",
+                "source": "tmdb-api",
+                "media_type": "movie" if args.movie else "tv",
+                "query": {"tmdb_id": args.tmdb_id},
+                "result": result,
+            }
+        )
+        return
+
     base_url, api_key = resolve_config(args)
     body: dict[str, Any] = {"ova": args.movie}
     if args.title:
         body["title"] = args.title
-    if args.tmdb_id:
-        body["tmdbId"] = args.tmdb_id
     response = request_json(
         base_url,
         api_key,
@@ -742,6 +1089,54 @@ def command_tmdb_lookup(args: argparse.Namespace) -> None:
             "command": "tmdb-lookup",
             "query": body,
             "result": unwrap_data(response),
+        }
+    )
+
+
+def command_tmdb_season(args: argparse.Namespace) -> None:
+    if args.season_number < 0:
+        raise AniRssError("TMDB season number must not be negative")
+    base_url, token, api_key = resolve_tmdb_credentials(args)
+    query = {"language": args.language} if args.language else None
+    result = request_tmdb_json(
+        base_url,
+        token,
+        api_key,
+        f"/tv/{urllib.parse.quote(args.tmdb_id, safe='')}/season/{args.season_number}",
+        query=query,
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "tmdb-season",
+            "source": "tmdb-api",
+            "query": {
+                "tmdb_id": args.tmdb_id,
+                "season_number": args.season_number,
+                "language": args.language,
+            },
+            "result": result,
+        }
+    )
+
+
+def command_tmdb_group_details(args: argparse.Namespace) -> None:
+    base_url, token, api_key = resolve_tmdb_credentials(args)
+    result = request_tmdb_json(
+        base_url,
+        token,
+        api_key,
+        f"/tv/episode_group/{urllib.parse.quote(args.group_id, safe='')}",
+        timeout=args.timeout,
+    )
+    print_json(
+        {
+            "ok": True,
+            "command": "tmdb-group-details",
+            "source": "tmdb-api",
+            "query": {"group_id": args.group_id},
+            "result": result,
         }
     )
 
@@ -804,6 +1199,12 @@ def command_set(args: argparse.Namespace) -> None:
         raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
     if not isinstance(ani.get("id"), str) or not ani["id"].strip():
         raise AniRssError("/api/setAni requires an existing Ani object with a non-empty id")
+    evidence = validate_write_evidence(
+        ani,
+        preview_path=getattr(args, "preview_evidence", None),
+        tmdb_lookup_path=getattr(args, "tmdb_lookup_evidence", None),
+        tmdb_season_path=getattr(args, "tmdb_season_evidence", None),
+    )
     response = request_json(
         base_url,
         api_key,
@@ -813,14 +1214,111 @@ def command_set(args: argparse.Namespace) -> None:
         body=ani,
         timeout=args.timeout,
     )
+    verification = verify_persisted_subscription(base_url, api_key, ani, args.timeout)
     print_json(
         {
             "ok": True,
             "command": "set",
             "move_files": args.move_files,
             "response": response,
+            "evidence": {
+                "ani_sha256": evidence["ani_sha256"],
+                "preview_input_sha256": evidence["preview"].get("input_sha256"),
+            },
+            "verification": verification,
         }
     )
+
+
+def subscription_identity_matches(candidate: dict[str, Any], expected: dict[str, Any]) -> bool:
+    for field in ("title", "season", "url", "subgroup"):
+        if field in expected and candidate.get(field) != expected.get(field):
+            return False
+    expected_tmdb = expected.get("tmdb")
+    candidate_tmdb = candidate.get("tmdb")
+    if isinstance(expected_tmdb, dict) and expected_tmdb.get("id"):
+        if not isinstance(candidate_tmdb, dict):
+            return False
+        if str(candidate_tmdb.get("id")) != str(expected_tmdb.get("id")):
+            return False
+    return True
+
+
+def subscription_matches_expected(candidate: dict[str, Any], expected: dict[str, Any]) -> bool:
+    expected_id = expected.get("id")
+    if isinstance(expected_id, str) and expected_id.strip():
+        if candidate.get("id") != expected_id:
+            return False
+    if not subscription_identity_matches(candidate, expected):
+        return False
+    for field in (
+        "match",
+        "exclude",
+        "standbyRssList",
+        "releaseDate",
+        "offset",
+        "totalEpisodeNumber",
+        "customEpisode",
+        "customEpisodeStr",
+        "customEpisodeGroupIndex",
+        "themoviedbName",
+    ):
+        if field in expected and candidate.get(field) != expected.get(field):
+            return False
+    return True
+
+
+def verify_persisted_subscription(
+    base_url: str,
+    api_key: str,
+    expected: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    response = request_json(base_url, api_key, "POST", "/api/listAni", timeout=timeout)
+    subscriptions = flatten_subscriptions(unwrap_data(response))
+    id_matches = [
+        item for item in subscriptions
+        if expected.get("id") and item.get("id") == expected.get("id")
+    ]
+    identity_matches = [
+        item for item in subscriptions if subscription_matches_expected(item, expected)
+    ]
+    matches = id_matches or identity_matches
+    if len(matches) != 1:
+        raise AniRssError(
+            "write returned, but persistence verification found "
+            f"{len(matches)} matching subscriptions; do not retry add before reviewing list output"
+        )
+    persisted = matches[0]
+    if not subscription_matches_expected(persisted, expected):
+        raise AniRssError(
+            "write returned, but the persisted subscription does not match the submitted object; "
+            "do not retry add before reviewing list output"
+        )
+    return {
+        "verified": True,
+        "match_count": len(matches),
+        "persisted": persisted,
+        "total_subscriptions": len(subscriptions),
+    }
+
+
+def preflight_duplicate_check(
+    base_url: str,
+    api_key: str,
+    expected: dict[str, Any],
+    timeout: int,
+) -> dict[str, Any]:
+    response = request_json(base_url, api_key, "POST", "/api/listAni", timeout=timeout)
+    subscriptions = flatten_subscriptions(unwrap_data(response))
+    matches = [
+        item for item in subscriptions if subscription_identity_matches(item, expected)
+    ]
+    if matches:
+        raise AniRssError(
+            "A matching subscription already exists; review list/get and use set for edits."
+        )
+    return {"checked": True, "matching_subscriptions": 0}
 
 
 def command_add(args: argparse.Namespace) -> None:
@@ -830,6 +1328,13 @@ def command_add(args: argparse.Namespace) -> None:
     ani = extract_ani_payload(read_json_arg(args.ani_json))
     if not isinstance(ani, dict):
         raise AniRssError("--ani-json must contain an Ani object or a wrapper with ani/data")
+    evidence = validate_write_evidence(
+        ani,
+        preview_path=getattr(args, "preview_evidence", None),
+        tmdb_lookup_path=getattr(args, "tmdb_lookup_evidence", None),
+        tmdb_season_path=getattr(args, "tmdb_season_evidence", None),
+    )
+    preflight = preflight_duplicate_check(base_url, api_key, ani, args.timeout)
     response = request_json(
         base_url,
         api_key,
@@ -838,7 +1343,20 @@ def command_add(args: argparse.Namespace) -> None:
         body=ani,
         timeout=args.timeout,
     )
-    print_json({"ok": True, "command": "add", "response": response})
+    verification = verify_persisted_subscription(base_url, api_key, ani, args.timeout)
+    print_json(
+        {
+            "ok": True,
+            "command": "add",
+            "response": response,
+            "evidence": {
+                "ani_sha256": evidence["ani_sha256"],
+                "preview_input_sha256": evidence["preview"].get("input_sha256"),
+            },
+            "preflight": preflight,
+            "verification": verification,
+        }
+    )
 
 
 def command_list(args: argparse.Namespace) -> None:
@@ -855,6 +1373,34 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--api-key", help=argparse.SUPPRESS)
     parser.add_argument("--api-key-file", help="File containing the ANI-RSS API key")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument(
+        "--result-file",
+        help="Persist the exact JSON result atomically for terminal/output recovery",
+    )
+
+
+def add_write_evidence_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--preview-evidence",
+        required=True,
+        help="JSON result from preview for the exact final Ani object",
+    )
+    parser.add_argument(
+        "--tmdb-lookup-evidence",
+        required=True,
+        help="JSON result from tmdb-lookup for the final TMDB id",
+    )
+    parser.add_argument(
+        "--tmdb-season-evidence",
+        help="JSON result from tmdb-season; required for TV subscriptions",
+    )
+
+
+def add_tmdb_args(parser: argparse.ArgumentParser) -> None:
+    add_common_args(parser)
+    parser.add_argument("--tmdb-base-url", help=argparse.SUPPRESS)
+    parser.add_argument("--tmdb-api-token", help=argparse.SUPPRESS)
+    parser.add_argument("--tmdb-api-key", help=argparse.SUPPRESS)
 
 
 def add_season_args(parser: argparse.ArgumentParser) -> None:
@@ -899,6 +1445,10 @@ def build_parser() -> argparse.ArgumentParser:
     patch_cmd = subparsers.add_parser(
         "patch", help="Apply validated field changes to an Ani JSON object"
     )
+    patch_cmd.add_argument(
+        "--result-file",
+        help="Persist the exact JSON result atomically for terminal/output recovery",
+    )
     patch_cmd.add_argument("--ani-json", required=True, help="Ani JSON path or '-' for stdin")
     patch_cmd.add_argument(
         "--patch-json", required=True, help="JSON object containing supported Ani field changes"
@@ -915,7 +1465,7 @@ def build_parser() -> argparse.ArgumentParser:
     tmdb_lookup = subparsers.add_parser(
         "tmdb-lookup", help="Read-only ANI-RSS TMDB lookup"
     )
-    add_common_args(tmdb_lookup)
+    add_tmdb_args(tmdb_lookup)
     lookup = tmdb_lookup.add_mutually_exclusive_group(required=True)
     lookup.add_argument("--title", help="Title to look up")
     lookup.add_argument("--tmdb-id", help="Exact TMDB id to retrieve")
@@ -923,6 +1473,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--movie", action="store_true", help="Use movie/OVA lookup instead of TV"
     )
     tmdb_lookup.set_defaults(func=command_tmdb_lookup)
+
+    tmdb_season = subparsers.add_parser(
+        "tmdb-season", help="Read the complete episode list for one TMDB season"
+    )
+    add_tmdb_args(tmdb_season)
+    tmdb_season.add_argument("--tmdb-id", required=True, help="TMDB TV series id")
+    tmdb_season.add_argument("--season-number", required=True, type=int)
+    tmdb_season.add_argument("--language", default="en-US")
+    tmdb_season.set_defaults(func=command_tmdb_season)
+
+    tmdb_group_details = subparsers.add_parser(
+        "tmdb-group-details", help="Read the complete episode-group ordering from TMDB"
+    )
+    add_tmdb_args(tmdb_group_details)
+    tmdb_group_details.add_argument("--group-id", required=True)
+    tmdb_group_details.set_defaults(func=command_tmdb_group_details)
 
     tmdb_groups = subparsers.add_parser(
         "tmdb-groups", help="Read-only ANI-RSS TMDB episode-group lookup"
@@ -942,6 +1508,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(set_cmd)
     set_cmd.add_argument("--ani-json", required=True, help="Existing Ani JSON path or '-' for stdin")
     set_cmd.add_argument("--confirm-set", action="store_true")
+    add_write_evidence_args(set_cmd)
     set_cmd.add_argument(
         "--move-files",
         action="store_true",
@@ -953,6 +1520,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(add)
     add.add_argument("--ani-json", required=True, help="Ani JSON path or '-' for stdin")
     add.add_argument("--confirm-add", action="store_true")
+    add_write_evidence_args(add)
     add.set_defaults(func=command_add)
 
     list_cmd = subparsers.add_parser("list", help="List ANI-RSS subscriptions")
@@ -963,8 +1531,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    global CURRENT_RESULT_FILE
     parser = build_parser()
     args = parser.parse_args(argv)
+    result_file = getattr(args, "result_file", None)
+    CURRENT_RESULT_FILE = Path(result_file) if result_file else None
     try:
         args.func(args)
     except AniRssError as exc:
