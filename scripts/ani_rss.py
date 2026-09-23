@@ -40,6 +40,22 @@ PATCHABLE_ANI_FIELDS = {
     "themoviedbName",
 }
 STANDBY_RSS_FIELDS = {"label", "url", "offset"}
+CONFIRMATION_ANI_FIELDS = (
+    "title",
+    "season",
+    "offset",
+    "releaseDate",
+    "totalEpisodeNumber",
+    "match",
+    "exclude",
+    "standbyRssList",
+    "themoviedbName",
+    "customEpisode",
+    "customEpisodeStr",
+    "customEpisodeGroupIndex",
+    "enable",
+    "ova",
+)
 BATCH_KEYWORD_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("keyword:合集", re.compile(r"合集")),
     ("keyword:全集", re.compile(r"全集")),
@@ -107,6 +123,94 @@ def json_sha256(value: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(rendered).hexdigest()
+
+
+def confirmation_url(value: Any) -> Any:
+    if not isinstance(value, str):
+        return value
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        netloc = parsed.netloc
+        if parsed.username is not None or parsed.password is not None:
+            hostname = parsed.hostname or ""
+            if ":" in hostname and not hostname.startswith("["):
+                hostname = f"[{hostname}]"
+            port = f":{parsed.port}" if parsed.port is not None else ""
+            netloc = f"[redacted]@{hostname}{port}"
+        if not parsed.query:
+            return urllib.parse.urlunsplit(
+                parsed._replace(
+                    netloc=netloc,
+                    fragment="[redacted]" if parsed.fragment else "",
+                )
+            )
+        sensitive = re.compile(
+            r"token|key|pass|secret|auth|signature|credential", re.IGNORECASE
+        )
+        query = urllib.parse.urlencode(
+            [
+                (name, "[redacted]" if sensitive.search(name) else item)
+                for name, item in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+            ]
+        )
+        return urllib.parse.urlunsplit(
+            parsed._replace(
+                netloc=netloc,
+                query=query,
+                fragment="[redacted]" if parsed.fragment else "",
+            )
+        )
+    except ValueError:
+        return "[URL omitted]"
+
+
+def confirmation_summary(ani: dict[str, Any]) -> dict[str, Any]:
+    """Return the exact Ani values that must be shown before a write."""
+    tmdb = ani.get("tmdb")
+    tmdb_summary = None
+    if isinstance(tmdb, dict):
+        tmdb_summary = {
+            key: tmdb.get(key)
+            for key in ("id", "name", "originalName", "tmdbType")
+            if key in tmdb
+        }
+    fields = {key: ani.get(key) for key in CONFIRMATION_ANI_FIELDS}
+    standby_rss = fields.get("standbyRssList")
+    if isinstance(standby_rss, list):
+        fields["standbyRssList"] = [
+            {**entry, "url": confirmation_url(entry.get("url"))}
+            if isinstance(entry, dict)
+            else entry
+            for entry in standby_rss
+        ]
+    return {
+        "source": {
+            "subgroup": ani.get("subgroup"),
+            "url": confirmation_url(ani.get("url")),
+            "type": ani.get("type"),
+        },
+        "fields": {
+            **fields,
+            "tmdb": tmdb_summary,
+        },
+    }
+
+
+def compare_confirmation_fields(
+    submitted: dict[str, Any], persisted: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    submitted_summary = confirmation_summary(submitted)
+    persisted_summary = confirmation_summary(persisted)
+    comparisons: dict[str, dict[str, Any]] = {}
+    for section in ("source", "fields"):
+        for field, submitted_value in submitted_summary[section].items():
+            persisted_value = persisted_summary[section].get(field)
+            comparisons[field] = {
+                "submitted": submitted_value,
+                "persisted": persisted_value,
+                "matches": submitted_value == persisted_value,
+            }
+    return comparisons
 
 
 def read_key_from_file(path: str) -> str:
@@ -989,6 +1093,10 @@ def command_patch(args: argparse.Namespace) -> None:
             "requires_user_confirmation": True,
             "patch": patch,
             "ani": patched,
+            "confirmation": {
+                "ani_sha256": json_sha256(patched),
+                **confirmation_summary(patched),
+            },
         }
     )
 
@@ -1012,6 +1120,10 @@ def command_preview(args: argparse.Namespace) -> None:
             "ok": True,
             "command": "preview",
             "input_sha256": json_sha256(ani),
+            "confirmation": {
+                "ani_sha256": json_sha256(ani),
+                **confirmation_summary(ani),
+            },
             "requires_user_confirmation": True,
             "preview": preview,
             "coverage": preview_coverage(preview),
@@ -1264,6 +1376,10 @@ def command_set(args: argparse.Namespace) -> None:
             "command": "set",
             "move_files": args.move_files,
             "response": response,
+            "submitted": {
+                "ani_sha256": evidence["ani_sha256"],
+                **confirmation_summary(ani),
+            },
             "evidence": {
                 "ani_sha256": evidence["ani_sha256"],
                 "preview_input_sha256": evidence["preview"].get("input_sha256"),
@@ -1333,15 +1449,30 @@ def verify_persisted_subscription(
             f"{len(matches)} matching subscriptions; do not retry add before reviewing list output"
         )
     persisted = matches[0]
-    if not subscription_matches_expected(persisted, expected):
+    field_comparison = compare_confirmation_fields(expected, persisted)
+    mismatches = [
+        field for field, result in field_comparison.items() if not result["matches"]
+    ]
+    if not subscription_matches_expected(persisted, expected) or mismatches:
+        diagnostic_fields = ("season", "offset", "releaseDate", "totalEpisodeNumber")
+        diagnostic = {
+            field: field_comparison[field]
+            for field in diagnostic_fields
+            if field in field_comparison and field in mismatches
+        }
         raise AniRssError(
-            "write returned, but the persisted subscription does not match the submitted object; "
-            "do not retry add before reviewing list output"
+            "write returned, but persisted confirmation fields differ from the submitted object: "
+            + ", ".join(mismatches or ["identity or unlisted Ani field"])
+            + ("; values=" + json.dumps(diagnostic, ensure_ascii=False) if diagnostic else "")
+            + "; do not report success or retry before reviewing list output"
         )
     return {
         "verified": True,
         "match_count": len(matches),
         "persisted": persisted,
+        "submitted_fields": confirmation_summary(expected),
+        "persisted_fields": confirmation_summary(persisted),
+        "field_comparison": field_comparison,
         "total_subscriptions": len(subscriptions),
     }
 
@@ -1392,6 +1523,10 @@ def command_add(args: argparse.Namespace) -> None:
             "ok": True,
             "command": "add",
             "response": response,
+            "submitted": {
+                "ani_sha256": evidence["ani_sha256"],
+                **confirmation_summary(ani),
+            },
             "evidence": {
                 "ani_sha256": evidence["ani_sha256"],
                 "preview_input_sha256": evidence["preview"].get("input_sha256"),

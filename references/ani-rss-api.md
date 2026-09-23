@@ -1,6 +1,6 @@
 # ANI-RSS API Reference
 
-This reference captures the ANI-RSS endpoints used by this skill. The validated local instance reported ANI-RSS `v3.1.49`.
+This reference captures the ANI-RSS endpoints used by this skill. The local instance was checked on 2026-09-22 and reported ANI-RSS `v3.2.36`. Its Swagger/OpenAPI endpoint was disabled; endpoint contracts were checked against the upstream controller/entity source.
 
 ## Authentication
 
@@ -87,6 +87,8 @@ Body:
 
 The response contains an `Ani` object.
 
+Important payload boundary: `RssToAniDTO` accepts only `url`, `type`, `bgmUrl`, `subgroup`, and `enable`. It does not accept `season`, `offset`, `releaseDate`, or `totalEpisodeNumber`. Apply those values to the returned Ani object, then pass that full object to preview/add/set. Never expect extra properties sent to `/rssToAni` to survive.
+
 ### Add Subscription
 
 ```text
@@ -96,7 +98,7 @@ Content-Type: application/json
 
 Body: the selected `Ani` object.
 
-The helper script requires `--confirm-add`, `--preview-evidence`, and `--tmdb-lookup-evidence` before calling this endpoint. TV subscriptions additionally require `--tmdb-season-evidence`. Evidence must match the final Ani object; `add` also runs a duplicate preflight and verifies the persisted object.
+The helper script requires `--confirm-add`, `--preview-evidence`, and `--tmdb-lookup-evidence` before calling this endpoint. TV subscriptions additionally require `--tmdb-season-evidence`. Evidence must match the final Ani object; `add` also runs a duplicate preflight and verifies the persisted object. The preview's `confirmation` summary is the authoritative user-facing summary of the exact body; `add` reports the submitted fields and compares them with the values returned by `listAni`. Report success only if every comparison matches.
 
 ### Edit an existing subscription
 
@@ -114,7 +116,7 @@ POST /api/previewAni
 Content-Type: application/json
 ```
 
-Body: the proposed `Ani` object. This is a read-only validation/preview step. Keep its response as evidence for the user; it does not replace the final `add --confirm-add` confirmation. The helper adds a local `input_sha256` and `coverage` summary with returned count, parsed episode range, unparsed items, gaps, duplicates, and first/middle/last parsed anchors. It explicitly marks full-feed verification as false unless the workflow checks the source range separately.
+Body: the proposed `Ani` object. This is a read-only validation/preview step. Keep its response as evidence for the user; it does not replace the final `add --confirm-add` confirmation. The helper adds a local `input_sha256`, a `confirmation` summary generated from the exact submitted body, and a `coverage` summary with returned count, parsed episode range, unparsed items, gaps, duplicates, and first/middle/last parsed anchors. It explicitly marks full-feed verification as false unless the workflow checks the source range separately. Do not modify or regenerate the Ani file after preview; add/set must use the same file and matching preview evidence.
 
 ### TMDB title lookup
 

@@ -18,6 +18,7 @@ Use the helper script as a thin ANI-RSS API adapter. The script collects data, a
 - Do not alter ANI-RSS global exclusion settings. They are instance-wide configuration, not part of an Ani subscription patch.
 - Use Mikan as the default source path for RSS discovery. For TV, first use the direct TMDB series endpoint and read its `seasons` list; only then query one or more real seasons for episode evidence. Do not replace this with a title-only Mikan lookup or by blindly querying the RSS season label.
 - Prefer `scripts/ani_rss.py` over hand-written HTTP calls.
+- Never write with a generic HTTP tool or call `/api/addAni` or `/api/setAni` directly. Use the helper's `add`/`set` commands so the submitted Ani is bound to the preview and checked against the persisted record.
 
 ## Chat workflow gates
 
@@ -221,13 +222,13 @@ python scripts/ani_rss.py preview \
   --result-file .ani-rss-runs/040-preview.json
 ```
 
-Check the returned `coverage` object as well as the raw preview. It reports the returned count, parsed episode min/max, unparsed items, duplicates, gaps, and first/middle/last parsed anchors. The preview also contains `input_sha256`; do not modify the final Ani JSON after this step. `full_feed_verified` remains false unless the source range is separately proven, but an ongoing RSS may be added when the observed parsed samples are sufficient and the limitation is stated.
+Check the returned `coverage` object as well as the raw preview. It reports the returned count, parsed episode min/max, unparsed items, duplicates, gaps, and first/middle/last parsed anchors. The preview's `confirmation` object is the authoritative summary of the exact Ani body sent to `/api/previewAni`; it includes the source, season, offset, release date, total episodes, TMDB identity, and matching rules, plus the object's SHA-256. Show those returned values to the user. Do not reconstruct them from memory, the patch file, or earlier reasoning. The preview also contains `input_sha256`; do not modify or regenerate the final Ani JSON after this step. `full_feed_verified` remains false unless the source range is separately proven, but an ongoing RSS may be added when the observed parsed samples are sufficient and the limitation is stated.
 
 For a complete or expected season range, inspect the first, middle, and last available parsed source episodes. Check every parsed returned item for a constant `target TMDB episode - parsed RSS episode` offset. If fewer than three items have a parsed episode number, the result is `insufficient-samples`; do not claim that the whole season is aligned. If the feed is rolling and does not contain the first or last episode, state that the preview proves only the observed range.
 
 The offset must produce the intended TMDB episode for every checked sample. If the result is wrong or the coverage is insufficient, patch the JSON and preview again; do not add or set yet.
 
-Before adding, summarize:
+Before adding, summarize the exact values from `preview.confirmation` and the preview result:
 
 - selected anime and primary RSS;
 - subtitle/spec interpretation and evidence;
@@ -279,7 +280,7 @@ python scripts/ani_rss.py add \
 
 If any evidence argument or `--confirm-add` is absent, the helper must refuse to call `/api/addAni`. `add` also performs a duplicate preflight before writing and then verifies the complete set of changed fields with `listAni`.
 
-`add` automatically performs a read-only `listAni` verification after the add response. Treat the result as successful only when exactly one persisted subscription matches the submitted identity and key fields. If the terminal output is blank or verification fails, do not retry `add`; run `get/list` first because the write may already have succeeded.
+After the user confirms, pass the same final Ani JSON used for preview and the matching `.ani-rss-runs/040-preview.json` to `add`. Do not rerun `rssToAni`, regenerate the draft, or switch to the original selected JSON between confirmation and submission. The helper rejects a different Ani hash. Its result includes the exact `submitted` confirmation summary and a `verification.field_comparison` between submitted and persisted values. Report success only when `verification.verified` is `true` and every comparison has `matches: true`; season, offset, release date, and total episodes must be visibly checked. If the command fails, output is blank, or any comparison fails, do not report success or retry `add`; run `get/list` first because the write may already have succeeded.
 
 ## Candidate and Edge-Case Handling
 

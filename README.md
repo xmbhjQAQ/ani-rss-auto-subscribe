@@ -190,7 +190,7 @@ python scripts/ani_rss.py preview `
   --result-file .ani-rss-runs/040-preview.json
 ```
 
-预览结果会附带 `coverage` 和 `input_sha256`。必须检查第一、中间、最后三个已解析样本，并核对所有返回项的 offset。少于 3 条已解析集数时只能判定为 `insufficient-samples`。滚动 RSS 可以只说明当前观测范围，不得声称覆盖完整季度。
+预览结果会附带 `coverage`、`input_sha256` 和 `confirmation`。`confirmation` 是实际发给 `/previewAni` 的 Ani 对象摘要，包含季度、offset、日期、总集数、TMDB 身份、来源和规则。向用户展示这些输出值，不要从先前推理或 patch 文件重述。必须检查第一、中间、最后三个已解析样本，并核对所有返回项的 offset。少于 3 条已解析集数时只能判定为 `insufficient-samples`。滚动 RSS 可以只说明当前观测范围，不得声称覆盖完整季度。
 
 最终添加订阅：
 
@@ -203,9 +203,9 @@ python scripts/ani_rss.py add `
   --confirm-add
 ```
 
-如果缺少任一证据文件或不传 `--confirm-add`，`add` 命令会拒绝调用 ANI-RSS。它还会先查重，再在添加后验证完整的关键字段。
+如果缺少任一证据文件或不传 `--confirm-add`，`add` 命令会拒绝调用 ANI-RSS。确认后必须复用预览时同一个 Ani JSON 和预览证据；不要重新运行 `rssToAni` 或切回原始草稿。哈希不一致时 helper 会拒绝提交。
 
-`add` 收到成功响应后会自动调用 `listAni` 验证持久化。必须确认唯一匹配的 `id`、标题/季数、RSS、字幕组、TMDB id 和关键规则。终端回显为空或验证失败时，不得直接重试 `add`，先运行 `get/list` 判断写入是否已经成功。
+`add` 收到成功响应后会自动调用 `listAni` 验证持久化。输出包含 `submitted` 摘要和 `verification.field_comparison`，逐项对照实际提交值与后台保存值。仅当 `verification.verified = true` 且所有 `matches = true`（特别是 season、offset、releaseDate、totalEpisodeNumber）时才能报告添加成功。不要从通用 HTTP 工具直接调用 `/api/addAni`/`/api/setAni`。终端回显为空或验证失败时，不得直接重试 `add`，先运行 `get/list` 判断写入是否已经成功。
 
 编辑已有订阅时，不能调用 `add`。先读取完整对象、patch 并 preview，用户确认后再提交：
 
