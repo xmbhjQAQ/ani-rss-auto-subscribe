@@ -1,6 +1,6 @@
 # ANI-RSS Auto Subscribe Agent Skill
 
-这是一个面向 AI Agent 的开源 Skill 项目，用来帮助 Codex、Claude Code 等支持 `SKILL.md` 的 Agent，通过 Mikan 搜索在自托管 [ANI-RSS](https://github.com/wushuo894/ani-rss) 实例里添加番剧订阅。
+这是一个面向 AI Agent 的开源 Skill 项目，用来帮助 Codex、Claude Code 等支持 `SKILL.md` 的 Agent，在自托管 [ANI-RSS](https://github.com/wushuo894/ani-rss) 实例里添加番剧订阅。默认查询 Mikan，支持按需查询 AniBT 和 AnimeGarden。
 
 项目目标不是让脚本或 LLM 替用户“拍板”，而是让脚本稳定地收集 ANI-RSS/Mikan 数据，把候选番剧、字幕组、RSS、样例标题等证据交给 LLM，由 LLM 整理、解释和推荐，最终由用户自己选择字幕组/RSS。
 
@@ -8,6 +8,8 @@
 
 - 通过 `POST /api/mikan?text=` 搜索番剧。
 - 通过 `POST /api/mikanGroup?url=` 获取 Mikan 字幕组/RSS 候选。
+- 通过 `--source ani-bt` / `--source anime-garden` 获取另外两个源的番剧和字幕组候选；AnimeGarden 是 api.animes.garden，不是 DMHY。
+- 通过 `render-options` 校验语言/版本描述和样本引用，生成包含字幕语言、形式、规格、证据和风险的固定编号卡片。
 - 输出字幕组、RSS、tags、样例标题等原始证据，让 LLM 判断字幕语言和规格。
 - 对样例标题做合集/整季包检测，提前暴露 ANI-RSS 可能无法按单集解析的风险。
 - 通过 `POST /api/rssToAni` 把用户确认的 RSS 转成 ANI-RSS 订阅对象。
@@ -101,7 +103,7 @@ $env:ANI_RSS_API_KEY = "<your-api-key>"
 export ANI_RSS_API_KEY_FILE="./ani-rss-key.txt"
 ```
 
-如果当前目录存在 `ani-rss-key.txt`，脚本也会把它当作本地 fallback key 文件。`ani-rss-key.txt`、`ani-rss-config.local.json`、`.env` 和本地生成的 JSON 文件已加入 `.gitignore`。
+配置先使用 `ANI_RSS_CONFIG_FILE` 指定的文件，否则查找当前目录，再查找 Skill 根目录。配置里的相对 key 文件路径以配置所在目录为基准；显式参数/环境变量里的路径仍以调用目录为基准。当前目录和 Skill 根目录的 `ani-rss-key.txt` 都可用作 fallback，便于 AstrBot 从其他目录调用。上述本地配置、key、`.env` 和生成的 JSON 已加入 `.gitignore`。
 
 ## 推荐流程
 
@@ -134,7 +136,9 @@ python scripts/ani_rss.py plan "租借女友 第五季"
 
 如果用户未写季数但唯一结果是第二季或更后面的季度，必须额外询问是否就是该季度；唯一结果不代表用户确认。
 
-Agent 应该把这些候选展示给用户。LLM 可以标出推荐项和理由，但不能把推荐当成选择；必须等待用户明确选择：
+候选展示须先按 [来源与候选卡片规范](references/source-selection.md) 填写样本支持的语言/版本说明，再运行 `render-options --plan-json <保存的plan> --options-json <说明文件> --result-file <卡片结果文件>`。直接展示返回的 `text`，不省略字幕语言、字幕形式、规格和依据；未知信息写“未知”，同组不同版本拆成选项。`build-from-rss` 新增必填的 `--options-evidence` 和 `--option-id`，因此部署时应一起更新脚本、SKILL.md 和 references。
+
+LLM 可以标出推荐项和理由，但不能把推荐当成选择；必须等待用户明确选择：
 
 1. 选择哪一个番剧候选。
 2. 选择哪一个字幕组/RSS 源。
@@ -146,7 +150,9 @@ python scripts/ani_rss.py build-from-rss \
   --rss "https://mikanime.tv/RSS/Bangumi?bangumiId=3945&subgroupid=1231" \
   --type mikan \
   --bgm-url "https://bgm.tv/subject/533027" \
-  --subgroup "沸班亚马制作组" > ani-rss-selected.local.json
+  --subgroup "沸班亚马制作组" \
+  --options-evidence .ani-rss-runs/<run-id>/015-options.json \
+  --option-id "<用户选择的option_id>" > ani-rss-selected.local.json
 ```
 
 如果需要修改 ANI-RSS 的匹配规则、日期或集数信息，先复制示例 patch，再按证据编辑：
@@ -190,7 +196,7 @@ python scripts/ani_rss.py preview `
   --result-file .ani-rss-runs/040-preview.json
 ```
 
-预览结果会附带 `coverage`、`input_sha256` 和 `confirmation`。`confirmation` 是实际发给 `/previewAni` 的 Ani 对象摘要，包含季度、offset、日期、总集数、TMDB 身份、来源和规则。向用户展示这些输出值，不要从先前推理或 patch 文件重述。必须检查第一、中间、最后三个已解析样本，并核对所有返回项的 offset。少于 3 条已解析集数时只能判定为 `insufficient-samples`。滚动 RSS 可以只说明当前观测范围，不得声称覆盖完整季度。
+预览结果附带 `coverage`、`input_sha256`、`confirmation` 和固定格式的 `confirmation_text`。原样展示 `confirmation_text`，再解释映射与所选字幕版本；参数来自实际预览对象，不从先前推理重述。检查第一、中间、最后三个不同集数，并核对所有返回项的 offset。空预览和 TV 不足三个不同已解析集数不能提交；同一集不同版本不计作三个锚点。滚动 RSS 只证明已观测范围。
 
 最终添加订阅：
 
@@ -325,9 +331,9 @@ Agent 看到这些信号时，应该在让用户确认字幕组之前先提示�
 Agent 应以 `SKILL.md` 作为主要操作说明。正常流程是：
 
 1. 运行 `plan`。
-2. 如果没有候选，向用户索要其他名称。
+2. 如果 Mikan 没有候选，先用搜索引擎核对标准片名和别名，再重查 Mikan；确认仍无结果或可用 RSS 时查询 AniBT/AnimeGarden。用户指定其他源则直接查指定源，接口错误单独报告。
 3. 如果有多个候选，让用户确认番剧。
-4. 展示字幕组、语言/规格和 RSS 源；LLM 可以推荐，但等待用户自己确认具体选择。
+4. 根据计划中的真实样本填写语言/版本说明，运行 `render-options` 并原样展示返回的 `text`。LLM 可以推荐，等待用户选择具体卡片；同组不同版本分开，未知信息明确写“未知”。
 5. 运行 `build-from-rss`。
 6. 运行 `tmdb-lookup`/`tmdb-groups`，先读取直接 TMDB 返回的 `seasons` 列表，再按 `references/tmdb-alignment.md` 比较 RSS 与 TMDB 的季度、集数和日期。
 7. 每个 TV 订阅都只对 `seasons` 列表中存在的季号运行 `tmdb-season`；只有标准季度无法解释 RSS 时才运行 `tmdb-group-details`，然后生成最小 patch 和 preview。
@@ -340,6 +346,6 @@ Agent 应以 `SKILL.md` 作为主要操作说明。正常流程是：
 - 不要提交 API Key。
 - 不要在聊天或日志里打印 API Key。
 - 不要内置 ANI-RSS endpoint。
-- 默认只使用 Mikan 流程，不默认调用 BGM 端点。
+- 默认使用 Mikan；名称核查后确无结果/可用 RSS，或用户指定其他源时，使用 AniBT/AnimeGarden（AnimeGarden 定位片名需要 ANI-RSS 的 BGM 搜索接口）。
 - 不要主动建议或添加备用 RSS；仅在用户明确要求时才处理。
 - 不要在测试中运行 `add --confirm-add`，除非你确实想修改 ANI-RSS 实例。

@@ -12,7 +12,17 @@ api-key: <key>
 
 Do not expose the key in output. The helper script reads configuration from command-line flags, environment variables, `ani-rss-config.local.json`, or the fallback `ani-rss-key.txt`.
 
-## Primary Mikan Flow
+## Source discovery
+
+## Additional primary sources
+
+AniBT: `POST /api/aniBT` with JSON `{ "title": "...", "bgmUrl": "", "season": "" }`; the result uses `byWeekday[].animes[]`, with a multilingual `title` object and a Bangumi `bgmId`. `POST /api/aniBTGroup?bgmId=...` returns `name`, `groupId`, `slug`, `rss`, and item-level `language`, `subtitle`, `resolution`, `episodeKey`. A non-empty title causes upstream to ignore the airing-season filter.
+
+AnimeGarden: use `POST /api/searchBgm?name=...` to locate a Bangumi subject (`id`, `name`, `nameCn`), then `POST /api/animeGardenGroup?bgmId=...` to obtain actual RSS/group resources (`id`, `name`, `rss`, `items[].fansub`, `provider`). `POST /api/animeGardenList?bgmUrl=...` supports exact identity lookup, but its returned `exists=true` is not a duplicate-subscription check. The helper deliberately returns unknown subscription status on this path. AnimeGarden is `api.animes.garden`, not DMHY.
+
+All three use `POST /api/rssToAni` with types `mikan`, `ani-bt`, or `anime-garden`. The helper requires `--options-evidence` plus `--option-id` and validates selected source identity before conversion. Read [source-selection.md](source-selection.md) for routing and fixed evidence-backed candidate cards. Default searches do not automatically query alternatives: the LLM must research names first, then invoke the authorized alternative-source queries.
+
+## Primary Mikan endpoints
 
 ### Search Mikan
 
@@ -233,4 +243,4 @@ Use web search as a research step when title aliases, official names, season num
 
 ## Non-Default Fallbacks
 
-Do not use BGM endpoints by default. If Mikan results are insufficient, ask the user before trying non-Mikan metadata or fallback endpoints.
+Use Mikan by default. After confirmed title-alias retries yield no work/usable RSS, query AniBT/AnimeGarden primary alternatives. User-specified sources can be queried directly. AnimeGarden's title lookup legitimately uses `searchBgm`. Never silently treat API failures as empty results or add standby RSS from an alternative search.

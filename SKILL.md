@@ -1,6 +1,6 @@
 ---
 name: ani-rss-auto-subscribe
-description: Search, customize, preview, and add anime subscriptions to a self-hosted ANI-RSS instance through Mikan. Use when RSS sources, subtitle choices, match/exclude rules, fallback RSS feeds, dates, seasons, episode offsets, or TMDB/Emby numbering need to be checked before subscribing.
+description: Search, preview, and add anime subscriptions to ANI-RSS using Mikan first, with AniBT and AnimeGarden alternatives. Present subtitle-language and version evidence for user selection, then verify TMDB/Emby numbering before subscribing.
 ---
 
 # ANI-RSS Auto Subscribe
@@ -16,7 +16,7 @@ Use the helper script as a thin ANI-RSS API adapter. The script collects data, a
 - Treat the RSS season label and the TMDB/Emby target season as separate concepts.
 - Do not propose, create, or edit `standbyRssList` unless the user explicitly asks for a fallback RSS source.
 - Do not alter ANI-RSS global exclusion settings. They are instance-wide configuration, not part of an Ani subscription patch.
-- Use Mikan as the default source path for RSS discovery. For TV, first use the direct TMDB series endpoint and read its `seasons` list; only then query one or more real seasons for episode evidence. Do not replace this with a title-only Mikan lookup or by blindly querying the RSS season label.
+- Use Mikan by default. If the user explicitly requests AniBT or AnimeGarden, query that source directly. Otherwise, research title aliases and retry Mikan before querying alternatives after a genuine empty result/no usable RSS. Source query errors are not evidence that a work is absent. Searching another primary source does not authorize standby RSS. For TV, read the direct TMDB series `seasons` list before obtaining per-season episode evidence.
 - Prefer `scripts/ani_rss.py` over hand-written HTTP calls.
 - Never write with a generic HTTP tool or call `/api/addAni` or `/api/setAni` directly. Use the helper's `add`/`set` commands so the submitted Ani is bound to the preview and checked against the persisted record.
 
@@ -57,7 +57,9 @@ Inspect and present:
 
 Do not silently choose between multiple plausible anime candidates or multiple plausible RSS groups.
 
-If `count = 0`, do not repeatedly invent random spellings. Preserve the original input and use the title-normalization procedure below to build a small, evidence-backed alias set, then retry Mikan with those aliases. If all retries fail, ask the user for another title or a direct Mikan/TMDB reference.
+If Mikan `count = 0`, preserve the input and use the title-normalization procedure below, then retry Mikan with the confirmed aliases. If those searches are genuinely empty, query AniBT and AnimeGarden using the confirmed title. If Mikan identifies the exact work but has no usable RSS, query the alternatives by its Bangumi identity. No extra permission is needed to search these primary-source alternatives. If all sources have no usable candidates, ask for another title or direct reference. Never silently convert an HTTP/authentication/schema failure into `count = 0`.
+
+Read [references/source-selection.md](references/source-selection.md) for source-specific commands, fixed language/version cards, and their schema. All three sources share the TMDB, patch, preview, confirmation, and persistence workflow below. No new dependencies or source-site API keys are required by the helper; ANI-RSS performs source requests.
 
 ### 1a. Normalize a title only after a failed Mikan search
 
@@ -75,7 +77,7 @@ The agent must not convert a search-engine hit directly into an Ani object. It m
 
 ### 2. Let the user choose the source
 
-Present the anime candidates and every plausible subtitle-group/RSS candidate with enough evidence to distinguish them: exact group label, RSS URL, tags, sample titles, language/spec clues, and batch-release risk. The agent may give a clearly labeled recommendation and explain its tradeoffs, but must not select on the user's behalf.
+After resolving anime/season identity, prepare language/version descriptions against the saved plan samples and run `render-options` as described in [references/source-selection.md](references/source-selection.md). Show the returned `text` verbatim; place recommendations after the cards. Never replace the cards with a bare list of subtitle-group names. Every option must include subtitle language, subtitle mode, resource specification, version condition, sample evidence, and risk. Unknown fields must visibly say `未知`; investigate more samples before suggesting a language-dependent choice. Do not infer language from a group name or confuse Japanese audio with Japanese subtitles. Split separately published language/spec versions into separate options even when they share an RSS. The user chooses an option, not merely an ambiguous group label.
 
 Wait for the user to name or explicitly confirm one exact anime candidate and one exact primary RSS/subtitle option. Do not call `build-from-rss`, create a source-specific regex, add a fallback, or call `add` before this choice. If the user says only “use the best one” or gives no group/RSS identity, ask a follow-up that makes the source choice explicit.
 
@@ -103,10 +105,12 @@ python scripts/ani_rss.py build-from-rss \
   --rss "<rss-url>" \
   --type mikan \
   --bgm-url "<bgm-url>" \
-  --subgroup "<group-label>" > ani-rss-selected.local.json
+  --subgroup "<group-label>" \
+  --options-evidence .ani-rss-runs/<run-id>/015-options.json \
+  --option-id "<user-selected-option-id>" > ani-rss-selected.local.json
 ```
 
-`build-from-rss` only converts RSS to an Ani object. It does not decide TMDB season mapping.
+`build-from-rss` checks that the RSS/type/group/Bangumi identity matches the selected rendered option, then converts RSS to an Ani object. For AniBT use `--type ani-bt`; for AnimeGarden use `--type anime-garden`. It does not decide TMDB mapping. The selected `version_filter` describes the user's release preference; after building, implement it with evidence-backed match/exclude rules and verify the actual matched versions in preview. Do not assume that choosing a group restricts all its RSS releases to the chosen language/spec.
 
 ### 4. Mandatory TMDB evidence
 
@@ -222,9 +226,9 @@ python scripts/ani_rss.py preview \
   --result-file .ani-rss-runs/040-preview.json
 ```
 
-Check the returned `coverage` object as well as the raw preview. It reports the returned count, parsed episode min/max, unparsed items, duplicates, gaps, and first/middle/last parsed anchors. The preview's `confirmation` object is the authoritative summary of the exact Ani body sent to `/api/previewAni`; it includes the source, season, offset, release date, total episodes, TMDB identity, and matching rules, plus the object's SHA-256. Show those returned values to the user. Do not reconstruct them from memory, the patch file, or earlier reasoning. The preview also contains `input_sha256`; do not modify or regenerate the final Ani JSON after this step. `full_feed_verified` remains false unless the source range is separately proven, but an ongoing RSS may be added when the observed parsed samples are sufficient and the limitation is stated.
+Check the returned `coverage` object as well as the raw preview. It reports returned count, parsed episode range, unparsed items, duplicates, gaps, and first/middle/last distinct-episode anchors. Show `confirmation_text` verbatim, then explain the source episode → TMDB mapping and how preview matches the user-selected language/version. The `confirmation` object is the authoritative summary of the exact Ani body sent to `/api/previewAni`; do not reconstruct parameters from memory or an earlier patch. The preview also contains `input_sha256`; do not modify or regenerate the final Ani JSON after this step. `full_feed_verified` remains false unless the source range is separately proven, but an ongoing RSS may be added when observed samples are sufficient and the limitation is stated.
 
-For a complete or expected season range, inspect the first, middle, and last available parsed source episodes. Check every parsed returned item for a constant `target TMDB episode - parsed RSS episode` offset. If fewer than three items have a parsed episode number, the result is `insufficient-samples`; do not claim that the whole season is aligned. If the feed is rolling and does not contain the first or last episode, state that the preview proves only the observed range.
+For a complete or expected season range, inspect the first, middle, and last available distinct parsed source episodes. Check every parsed returned item for a constant `target TMDB episode - parsed RSS episode` offset. Fewer than three distinct parsed episodes is `insufficient-samples`; different release versions of one episode do not count as different anchors. If the feed is rolling and does not contain the first or last episode, state that the preview proves only the observed range.
 
 The offset must produce the intended TMDB episode for every checked sample. If the result is wrong or the coverage is insufficient, patch the JSON and preview again; do not add or set yet.
 
@@ -278,7 +282,7 @@ python scripts/ani_rss.py add \
   --confirm-add
 ```
 
-If any evidence argument or `--confirm-add` is absent, the helper must refuse to call `/api/addAni`. `add` also performs a duplicate preflight before writing and then verifies the complete set of changed fields with `listAni`.
+If any evidence argument or `--confirm-add` is absent, the helper must refuse to call `/api/addAni`. Empty previews and TV previews containing fewer than three distinct parsed episodes cannot authorize a write. `add` checks duplicate sources and other feeds sharing the same TMDB identity/season, then verifies persisted fields with `listAni`. For a genuinely distinct cour/range within the same TMDB season, explain the overlap and obtain the user's explicit range confirmation before supplying `--distinct-feed-reason`. Do not use that argument to bypass accidental duplicates or replace a source; use `set` for replacement.
 
 After the user confirms, pass the same final Ani JSON used for preview and the matching `.ani-rss-runs/040-preview.json` to `add`. Do not rerun `rssToAni`, regenerate the draft, or switch to the original selected JSON between confirmation and submission. The helper rejects a different Ani hash. Its result includes the exact `submitted` confirmation summary and a `verification.field_comparison` between submitted and persisted values. Report success only when `verification.verified` is `true` and every comparison has `matches: true`; season, offset, release date, and total episodes must be visibly checked. If the command fails, output is blank, or any comparison fails, do not report success or retry `add`; run `get/list` first because the write may already have succeeded.
 
@@ -289,7 +293,7 @@ After the user confirms, pass the same final Ani JSON used for preview and the m
 - `count = 1`: still show the exact subtitle group/RSS and wait for the user's explicit choice; do not infer consent from uniqueness.
 - `exists = true`: warn that the title may already be subscribed. If the user asks to edit it, use `get` → `patch` → `preview` → `set`, never `add`.
 - `exists = false`: do not treat that as proof of uniqueness; compare TMDB id/title against `list` results because Mikan can expose the same work under a new page or RSS URL.
-- Missing, stale, or empty RSS groups: explain the problem and ask whether to try a non-Mikan fallback; do not silently switch sources.
+- Missing or empty Mikan RSS groups for an identified work: query AniBT/AnimeGarden primary-source alternatives and present their cards. Report source failures separately. Never turn those queries into standby RSS entries automatically.
 - Unclear subtitle tags: show raw evidence and ask the user; do not classify with hard-coded language regexes.
 - Batch-release evidence: warn that download may succeed while per-episode parsing fails.
 - Different cour/part feeds: do not silently model them as standby RSS. Do not add standby RSS at all unless the user requested one.
@@ -307,6 +311,8 @@ The helper reads configuration in this order:
 2. `ANI_RSS_BASE_URL`, `ANI_RSS_API_KEY`, and `ANI_RSS_API_KEY_FILE`;
 3. `ani-rss-config.local.json`;
 4. local `ani-rss-key.txt` fallback.
+
+Local configuration is discovered from `ANI_RSS_CONFIG_FILE`, the working directory, then the Skill root. Key-file paths inside local configuration are relative to that configuration file. This permits AstrBot to invoke the helper by absolute path from another working directory. Generated file/result paths remain relative to the caller; use explicit per-request paths.
 
 Keep API keys, local config, generated Ani JSON, and TMDB lookup output out of commits.
 

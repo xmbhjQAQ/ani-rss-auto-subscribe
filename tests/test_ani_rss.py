@@ -35,7 +35,7 @@ class AniAdapterTests(unittest.TestCase):
                 "ok": True,
                 "command": "preview",
                 "input_sha256": ani_rss.json_sha256(ani),
-                "preview": {"items": []},
+                "preview": {"items": [{"episode": number} for number in (1, 2, 3)]},
             }
         )
         lookup = self.write_json(
@@ -425,6 +425,7 @@ class AniAdapterTests(unittest.TestCase):
                         "ok": True,
                         "command": "preview",
                         "input_sha256": ani_rss.json_sha256(ani),
+                        "preview": {"items": [{"episode": number} for number in (1, 2, 3)]},
                     }
                 ),
                 tmdb_lookup_path=lookup,

@@ -20,6 +20,9 @@ from typing import Any
 
 LOCAL_KEY_FILE = "ani-rss-key.txt"
 LOCAL_CONFIG_FILE = "ani-rss-config.local.json"
+SKILL_ROOT = Path(__file__).resolve().parent.parent
+SOURCES = ("mikan", "ani-bt", "anime-garden")
+SOURCE_LABELS = {"mikan": "Mikan", "ani-bt": "AniBT", "anime-garden": "AnimeGarden"}
 DEFAULT_TIMEOUT = 60
 EPISODE_RANGE_LIMIT = 200
 CURRENT_RESULT_FILE: Path | None = None
@@ -220,9 +223,19 @@ def read_key_from_file(path: str) -> str:
         raise AniRssError(f"Cannot read API key file: {path}: {exc}") from exc
 
 
-def load_local_config() -> dict[str, Any]:
+def local_config_path() -> Path:
+    explicit = os.environ.get("ANI_RSS_CONFIG_FILE")
+    if explicit:
+        return Path(explicit).expanduser().resolve()
     path = Path(LOCAL_CONFIG_FILE)
+    return path.resolve() if path.exists() else SKILL_ROOT / LOCAL_CONFIG_FILE
+
+
+def load_local_config() -> dict[str, Any]:
+    path = local_config_path()
     if not path.exists():
+        if os.environ.get("ANI_RSS_CONFIG_FILE"):
+            raise AniRssError("ANI_RSS_CONFIG_FILE does not exist")
         return {}
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -256,8 +269,11 @@ def resolve_config(args: argparse.Namespace) -> tuple[str, str]:
         getattr(args, "api_key_file", None)
         or os.environ.get("ANI_RSS_API_KEY_FILE")
         or local_config.get("api_key_file")
-        or (LOCAL_KEY_FILE if Path(LOCAL_KEY_FILE).exists() else None)
+        or (str(Path(LOCAL_KEY_FILE).resolve()) if Path(LOCAL_KEY_FILE).exists() else None)
+        or (str(SKILL_ROOT / LOCAL_KEY_FILE) if (SKILL_ROOT / LOCAL_KEY_FILE).exists() else None)
     )
+    if key_file and not getattr(args, "api_key_file", None) and not os.environ.get("ANI_RSS_API_KEY_FILE"):
+        key_file = str(local_config_path().parent / key_file)
     if not api_key and key_file:
         api_key = read_key_from_file(key_file)
     if not api_key:
@@ -355,13 +371,20 @@ def ensure_list(value: Any) -> list[Any]:
     return [value]
 
 
+def bgm_id_from_url(value: Any) -> str | None:
+    match = re.search(r"/subject/(\d+)(?:[/?#]|$)", str(value or ""))
+    return match.group(1) if match else None
+
+
 def normalize_mikan_candidate(item: dict[str, Any]) -> dict[str, Any]:
     groups = ensure_list(item.get("groups"))
     return {
+        "source": "mikan",
         "title": item.get("title"),
         "url": item.get("url"),
         "bangumi_id": item.get("bangumiId"),
         "bgm_url": item.get("bgmUrl"),
+        "bgm_id": bgm_id_from_url(item.get("bgmUrl")),
         "exists": item.get("exists"),
         "score": item.get("score"),
         "cover": item.get("cover"),
@@ -370,22 +393,29 @@ def normalize_mikan_candidate(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_group(group: dict[str, Any], *, sample_limit: int = 5) -> dict[str, Any]:
+def normalize_group(
+    group: dict[str, Any], *, sample_limit: int = 5, source: str = "mikan"
+) -> dict[str, Any]:
     items = [item for item in ensure_list(group.get("items")) if isinstance(item, dict)]
+    if sample_limit < 1:
+        raise AniRssError("sample-limit must be positive")
     samples = [normalize_item(item) for item in items[:sample_limit]]
+    label = group.get("label") if source == "mikan" else group.get("name")
     tags = []
     group_regex = group.get("groupRegex")
     if isinstance(group_regex, dict):
         tags = [str(tag) for tag in ensure_list(group_regex.get("tags"))]
-    batch_evidence = batch_evidence_from_samples(group.get("label"), samples)
+    batch_evidence = batch_evidence_from_samples(label, samples)
     return {
-        "label": group.get("label"),
-        "subgroup_id": group.get("subgroupId"),
+        "source": source,
+        "label": label,
+        "subgroup_id": group.get("subgroupId") if source == "mikan" else group.get("groupId", group.get("id")),
+        "slug": group.get("slug"),
         "rss": group.get("rss"),
-        "bgm_url": group.get("bgmUrl"),
+        "bgm_url": group.get("bgmUrl") or (f"https://bgm.tv/subject/{group['bgmId']}" if group.get("bgmId") else None),
         "update_day": group.get("updateDay"),
         "tags": tags,
-        "language_evidence": language_evidence(group.get("label"), tags, samples),
+        "language_evidence": language_evidence(label, tags, samples),
         "batch_evidence": batch_evidence,
         "download_risk": (
             "batch-release-detected"
@@ -393,6 +423,9 @@ def normalize_group(group: dict[str, Any], *, sample_limit: int = 5) -> dict[str
             else "normal"
         ),
         "samples": samples,
+        "returned_item_count": len(items),
+        "sample_count": len(samples),
+        "full_feed_verified": False,
     }
 
 
@@ -401,9 +434,14 @@ def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
     return {
         "title": title,
         "episode": item.get("episode"),
-        "subgroup": item.get("subgroup"),
+        "subgroup": item.get("subgroup") or (item.get("fansub") or {}).get("name"),
         "format_size": item.get("formatSize"),
-        "pub_date": item.get("pubDate"),
+        "pub_date": item.get("pubDate", item.get("publishedAt", item.get("createdAt"))),
+        "source_episode_key": item.get("episodeKey"),
+        "subtitle_languages": item.get("language"),
+        "subtitle_mode": item.get("subtitle"),
+        "resolution": item.get("resolution"),
+        "provider": item.get("provider"),
         "release_detection": detect_release_pattern(title),
     }
 
@@ -532,24 +570,83 @@ def batch_evidence_from_samples(group_label: Any, samples: list[dict[str, Any]])
     }
 
 
+def search_candidates(args: argparse.Namespace, base_url: str, api_key: str) -> list[dict[str, Any]]:
+    source = getattr(args, "source", "mikan")
+    bgm_url = getattr(args, "bgm_url", None)
+    if source == "mikan":
+        data = unwrap_data(request_json(
+            base_url, api_key, "POST", "/api/mikan", query={"text": args.title},
+            body=season_body(args), timeout=args.timeout,
+        ))
+        if not isinstance(data, dict) or not isinstance(data.get("weeks"), list):
+            raise AniRssError("Unexpected Mikan search response; not an empty search result")
+        candidates = flatten_mikan_items(data)
+    elif source == "ani-bt":
+        year, season = getattr(args, "year", None), getattr(args, "season", None)
+        data = unwrap_data(request_json(
+            base_url, api_key, "POST", "/api/aniBT",
+            body={"title": "" if bgm_url else args.title, "bgmUrl": bgm_url or "",
+                  "season": f"{year}{season}" if year and season else ""}, timeout=args.timeout,
+        ))
+        if not isinstance(data, dict) or not isinstance(data.get("byWeekday"), list):
+            raise AniRssError("Unexpected AniBT search response; not an empty search result")
+        candidates = []
+        for week in data["byWeekday"]:
+            for item in ensure_list(week.get("animes")):
+                titles = item.get("title") or {}
+                identifier = str(item.get("bgmId") or "")
+                candidates.append({
+                    "source": source, "title": titles.get("chinese") or titles.get("primary"),
+                    "aliases": titles, "bgm_id": identifier,
+                    "bgm_url": f"https://bgm.tv/subject/{identifier}",
+                    "url": f"https://anibt.net/anime/{identifier}",
+                    "exists": item.get("exists"), "score": item.get("rating"),
+                    "release_count": item.get("rssReleaseCount"), "groups": [],
+                    "week_label": week.get("weekdayLabel"),
+                })
+    elif source == "anime-garden":
+        if bgm_url:
+            data = unwrap_data(request_json(
+                base_url, api_key, "POST", "/api/animeGardenList", query={"bgmUrl": bgm_url}, timeout=args.timeout,
+            ))
+            if not isinstance(data, list):
+                raise AniRssError("Unexpected AnimeGarden list response")
+            items = [item for week in data for item in ensure_list(week.get("subjects"))]
+        else:
+            data = unwrap_data(request_json(
+                base_url, api_key, "POST", "/api/searchBgm", query={"name": args.title}, timeout=args.timeout,
+            ))
+            if not isinstance(data, list):
+                raise AniRssError("Unexpected Bangumi search response")
+            items = data
+        candidates = []
+        for item in items:
+            identifier = str(item.get("id") or "")
+            candidates.append({
+                "source": source, "title": item.get("nameCn") or item.get("name"),
+                "aliases": {"original": item.get("name"), "chinese": item.get("nameCn")},
+                "bgm_id": identifier, "bgm_url": f"https://bgm.tv/subject/{identifier}",
+                "url": f"https://bgm.tv/subject/{identifier}",
+                "exists": None, "metadata_only": True, "date": item.get("date"), "groups": [],
+            })
+    else:
+        raise AniRssError("Unsupported source")
+    for candidate in candidates:
+        candidate["candidate_id"] = json_sha256({
+            "source": source, "url": candidate.get("url"), "bgm_id": candidate.get("bgm_id"),
+        })[:16]
+    return candidates
+
+
 def command_search(args: argparse.Namespace) -> None:
     base_url, api_key = resolve_config(args)
-    response = request_json(
-        base_url,
-        api_key,
-        "POST",
-        "/api/mikan",
-        query={"text": args.title},
-        body=season_body(args),
-        timeout=args.timeout,
-    )
-    data = unwrap_data(response)
-    candidates = flatten_mikan_items(data)
+    candidates = search_candidates(args, base_url, api_key)
     print_json(
         {
             "ok": True,
             "command": "search",
             "title": args.title,
+            "source": getattr(args, "source", "mikan"),
             "count": len(candidates),
             "candidates": candidates,
         }
@@ -557,32 +654,49 @@ def command_search(args: argparse.Namespace) -> None:
 
 
 def fetch_groups(
-    base_url: str, api_key: str, url: str, timeout: int, sample_limit: int
+    base_url: str, api_key: str, url: str, timeout: int, sample_limit: int,
+    *, source: str = "mikan", bgm_id: str | None = None,
 ) -> list[dict[str, Any]]:
+    if source == "mikan":
+        if not url:
+            raise AniRssError("Mikan groups require --url")
+        endpoint, query = "/api/mikanGroup", {"url": url}
+    else:
+        if not bgm_id or not str(bgm_id).isdigit():
+            raise AniRssError("AniBT/AnimeGarden groups require a numeric --bgm-id")
+        endpoint = "/api/aniBTGroup" if source == "ani-bt" else "/api/animeGardenGroup"
+        query = {"bgmId": str(bgm_id)}
     response = request_json(
         base_url,
         api_key,
         "POST",
-        "/api/mikanGroup",
-        query={"url": url},
+        endpoint,
+        query=query,
         timeout=timeout,
     )
     groups = unwrap_data(response)
-    return [
-        normalize_group(group, sample_limit=sample_limit)
+    if not isinstance(groups, list):
+        raise AniRssError("Unexpected group response; not an empty RSS list")
+    normalized = [
+        normalize_group(group, sample_limit=sample_limit, source=source)
         for group in ensure_list(groups)
         if isinstance(group, dict)
     ]
+    for group in normalized:
+        group["group_key"] = json_sha256({"source": source, "rss": group.get("rss"), "label": group.get("label")})[:16]
+    return normalized
 
 
 def command_groups(args: argparse.Namespace) -> None:
     base_url, api_key = resolve_config(args)
-    groups = fetch_groups(base_url, api_key, args.url, args.timeout, args.sample_limit)
+    groups = fetch_groups(base_url, api_key, args.url or "", args.timeout, args.sample_limit,
+                          source=args.source, bgm_id=args.bgm_id)
     print_json(
         {
             "ok": True,
             "command": "groups",
             "url": args.url,
+            "source": args.source,
             "count": len(groups),
             "groups": groups,
         }
@@ -591,27 +705,14 @@ def command_groups(args: argparse.Namespace) -> None:
 
 def command_plan(args: argparse.Namespace) -> None:
     base_url, api_key = resolve_config(args)
-    response = request_json(
-        base_url,
-        api_key,
-        "POST",
-        "/api/mikan",
-        query={"text": args.title},
-        body=season_body(args),
-        timeout=args.timeout,
-    )
-    candidates = flatten_mikan_items(unwrap_data(response))
+    source = getattr(args, "source", "mikan")
+    candidates = search_candidates(args, base_url, api_key)
     for candidate in candidates:
-        if candidate.get("groups"):
-            continue
         url = candidate.get("url")
-        if not url:
-            candidate["groups"] = []
-            candidate["group_error"] = "candidate has no Mikan URL"
-            continue
         try:
             candidate["groups"] = fetch_groups(
-                base_url, api_key, str(url), args.timeout, args.sample_limit
+                base_url, api_key, str(url or ""), args.timeout, args.sample_limit,
+                source=source, bgm_id=candidate.get("bgm_id"),
             )
             candidate["group_count"] = len(candidate["groups"])
         except AniRssError as exc:
@@ -622,6 +723,8 @@ def command_plan(args: argparse.Namespace) -> None:
             "ok": True,
             "command": "plan",
             "title": args.title,
+            "source": source,
+            "next_action": "normalize-title-before-other-sources" if not candidates and source == "mikan" else "inspect-candidates-and-render-options",
             "requires_user_confirmation": True,
             "count": len(candidates),
             "candidates": candidates,
@@ -629,8 +732,106 @@ def command_plan(args: argparse.Namespace) -> None:
     )
 
 
+def render_options(plan: dict[str, Any], assessment: dict[str, Any]) -> dict[str, Any]:
+    """Validate LLM descriptions against source samples and render stable chat cards."""
+    if plan.get("command") != "plan" or plan.get("ok") is not True:
+        raise AniRssError("--plan-json must contain a successful plan result")
+    entries = assessment.get("options")
+    if not isinstance(entries, list) or not entries:
+        raise AniRssError("options must be a non-empty array")
+    catalogue = {
+        (candidate.get("candidate_id"), group.get("group_key")): (candidate, group)
+        for candidate in plan.get("candidates", [])
+        for group in candidate.get("groups", [])
+        if group.get("rss") and group.get("label")
+    }
+    output, cards, seen = [], [], set()
+    required = {"candidate_id", "group_key", "language_status", "subtitle_languages",
+                "subtitle_mode", "resource_spec", "version_filter", "evidence"}
+    for number, entry in enumerate(entries, 1):
+        if not isinstance(entry, dict) or set(entry) != required:
+            raise AniRssError("Each option requires exactly: " + ", ".join(sorted(required)))
+        for field in required - {"evidence"}:
+            if not isinstance(entry[field], str) or not entry[field].strip() or "\n" in entry[field] or "\r" in entry[field]:
+                raise AniRssError(f"Option {field} must be a non-empty single-line string")
+        key = (entry["candidate_id"], entry["group_key"])
+        if key not in catalogue:
+            raise AniRssError("Option candidate/group does not exist in the saved plan")
+        candidate, group = catalogue[key]
+        if entry["language_status"] not in {"confirmed", "mixed", "unknown"}:
+            raise AniRssError("language_status must be confirmed, mixed, or unknown")
+        if entry["language_status"] == "unknown" and entry["subtitle_languages"] != "未知":
+            raise AniRssError("Unknown subtitle language must be displayed as 未知")
+        if entry["language_status"] != "unknown" and entry["subtitle_languages"] == "未知":
+            raise AniRssError("Known subtitle language requires a concrete description")
+        references = entry["evidence"]
+        if not isinstance(references, list) or (entry["language_status"] != "unknown" and not references):
+            raise AniRssError("Known/mixed language requires sample evidence")
+        quotes = []
+        for reference in references:
+            if not isinstance(reference, dict) or set(reference) != {"sample_index", "field", "quote"}:
+                raise AniRssError("Evidence requires sample_index, field, and quote")
+            index, field, quote = reference["sample_index"], reference["field"], reference["quote"]
+            if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(group["samples"]):
+                raise AniRssError("Evidence sample_index is outside the saved samples")
+            if field not in {"title", "subtitle_languages", "subtitle_mode", "resolution"}:
+                raise AniRssError("Evidence must cite subtitle/spec sample fields, not group names or audio")
+            value = group["samples"][index].get(field)
+            value_text = json.dumps(value, ensure_ascii=False) if isinstance(value, list) else str(value or "")
+            if not isinstance(quote, str) or not quote.strip() or quote not in value_text or "\n" in quote or "\r" in quote:
+                raise AniRssError("Evidence quote does not occur in the cited source sample")
+            quotes.append(f"样本{index + 1} {field}「{quote}」")
+        option_id = json_sha256(entry)[:16]
+        if option_id in seen:
+            raise AniRssError("Duplicate option")
+        seen.add(option_id)
+        source = candidate["source"]
+        risk = "发现合集/多集包标记，需核查" if group["download_risk"] == "batch-release-detected" else "当前样本未发现合集标记；仅代表已观测范围"
+        card = (
+            f"{number}. {SOURCE_LABELS[source]} · {group['label']}\n"
+            f"番剧：{candidate.get('title')}\n"
+            f"字幕语言：{entry['subtitle_languages']}（{ {'confirmed': '已确认', 'mixed': '混合版本', 'unknown': '未知'}[entry['language_status']] }）\n"
+            f"字幕形式：{entry['subtitle_mode']}\n"
+            f"资源规格：{entry['resource_spec']}\n"
+            f"版本条件：{entry['version_filter']}\n"
+            f"依据：{'；'.join(quotes) or '未找到可确认字幕语言的样本证据'}\n"
+            f"风险：{risk}\n"
+            f"RSS：{confirmation_url(group['rss'])}"
+        )
+        cards.append(card)
+        output.append({"number": number, "option_id": option_id, **entry,
+                       "source": source, "rss": group["rss"], "subgroup": group["label"],
+                       "bgm_url": candidate.get("bgm_url"), "title": candidate.get("title")})
+    return {"ok": True, "command": "render-options", "requires_user_selection": True,
+            "plan_sha256": json_sha256(plan), "options": output,
+            "text": "\n\n".join(cards) + "\n\n请选择编号；推荐不代表已经选择。"}
+
+
+def command_render_options(args: argparse.Namespace) -> None:
+    print_json(render_options(read_object_arg(args.plan_json, "--plan-json"),
+                              read_object_arg(args.options_json, "--options-json")))
+
+
 def command_build_from_rss(args: argparse.Namespace) -> None:
     base_url, api_key = resolve_config(args)
+    evidence = read_object_arg(args.options_evidence, "--options-evidence")
+    if evidence.get("ok") is not True or evidence.get("command") != "render-options":
+        raise AniRssError("build requires a successful render-options result")
+    selections = [option for option in evidence.get("options", []) if option.get("option_id") == args.option_id]
+    if len(selections) != 1:
+        raise AniRssError("Selected option-id must identify exactly one rendered option")
+    selected = selections[0]
+    if any(selected.get(field) != value for field, value in (
+        ("rss", args.rss), ("source", args.type), ("subgroup", args.subgroup), ("bgm_url", args.bgm_url)
+    )):
+        raise AniRssError("Selected RSS/type/group/Bangumi does not match the rendered option")
+    params = urllib.parse.parse_qs(urllib.parse.urlsplit(args.rss).query)
+    expected_id = bgm_id_from_url(args.bgm_url)
+    if args.type in ("ani-bt", "anime-garden"):
+        field = "bgmId" if args.type == "ani-bt" else "subject"
+        source_id = params.get(field, [None])[0]
+        if not expected_id or source_id != expected_id:
+            raise AniRssError("RSS Bangumi id does not match --bgm-url for this source")
     body = {
         "url": args.rss,
         "type": args.type,
@@ -646,12 +847,18 @@ def command_build_from_rss(args: argparse.Namespace) -> None:
         body=body,
         timeout=args.timeout,
     )
+    ani = unwrap_data(response)
+    if not isinstance(ani, dict) or any(ani.get(field) != body[field] for field in ("url", "type", "subgroup")):
+        raise AniRssError("RSS draft source does not match the selected RSS/type/group")
+    if bgm_id_from_url(ani.get("bgmUrl")) != expected_id:
+        raise AniRssError("RSS draft Bangumi identity does not match the selected work")
     print_json(
         {
             "ok": True,
             "command": "build-from-rss",
             "source": body,
-            "ani": unwrap_data(response),
+            "selected_option": selected,
+            "ani": ani,
         }
     )
 
@@ -974,6 +1181,11 @@ def validate_write_evidence(
         raise AniRssError(
             "Preview evidence does not match the Ani object being written; run preview again."
         )
+    coverage = preview_coverage(preview_evidence.get("preview"))
+    if coverage["returned_count"] == 0:
+        raise AniRssError("Preview contains no items; refusing to write an unverified RSS")
+    if is_tv_ani(ani) and coverage["coverage_status"] != "observed-range":
+        raise AniRssError("TV preview requires at least three distinct parsed episodes before writing")
 
     tmdb_id = tmdb_id_from_ani(ani)
     if not tmdb_id:
@@ -1127,7 +1339,29 @@ def command_preview(args: argparse.Namespace) -> None:
             "requires_user_confirmation": True,
             "preview": preview,
             "coverage": preview_coverage(preview),
+            "confirmation_text": render_confirmation(ani, preview),
         }
+    )
+
+
+def render_confirmation(ani: dict[str, Any], preview: Any) -> str:
+    summary = confirmation_summary(ani)
+    fields, source = summary["fields"], summary["source"]
+    tmdb = fields.get("tmdb") or {}
+    coverage = preview_coverage(preview)
+    def display(value: Any) -> str:
+        return "未知" if value is None else json.dumps(value, ensure_ascii=False)
+    return (
+        f"待确认订阅：{ani.get('title') or '未知'}\n"
+        f"来源：{SOURCE_LABELS.get(source['type'], source['type'] or '未知')}\n"
+        f"字幕组：{source['subgroup'] or '未知'}\nRSS：{source['url'] or '未知'}\n"
+        f"TMDB：{tmdb.get('id', '未知')} · {tmdb.get('name') or tmdb.get('originalName') or '未知'}\n"
+        f"目标季度：{display(fields['season'])}\n集数偏移：{display(fields['offset'])}\n"
+        f"日期：{display(fields['releaseDate'])}\n总集数：{display(fields['totalEpisodeNumber'])}\n"
+        f"匹配规则：{display(fields['match'])}\n排除规则：{display(fields['exclude'])}\n"
+        f"备用RSS：{display(fields['standbyRssList'])}\n"
+        f"预览：{coverage['returned_count']}条资源，{coverage['unique_episode_count']}个不同已解析集数；仅验证已观测范围\n"
+        "请确认以上实际参数后再添加。"
     )
 
 
@@ -1148,6 +1382,7 @@ def preview_coverage(value: Any) -> dict[str, Any]:
         parsed_items,
         key=lambda item: float(item.get("episode")),
     )
+    distinct_items = list({float(item["episode"]): item for item in ordered}.values())
     unique_episodes = sorted(set(episode_values))
     duplicate_episodes = sorted(
         episode for episode in set(episode_values) if episode_values.count(episode) > 1
@@ -1164,8 +1399,8 @@ def preview_coverage(value: Any) -> dict[str, Any]:
             ]
 
     anchor_indices: list[int] = []
-    if ordered:
-        anchor_indices = [0, len(ordered) // 2, len(ordered) - 1]
+    if distinct_items:
+        anchor_indices = [0, len(distinct_items) // 2, len(distinct_items) - 1]
         anchor_indices = list(dict.fromkeys(anchor_indices))
     anchors = [
         {
@@ -1174,7 +1409,7 @@ def preview_coverage(value: Any) -> dict[str, Any]:
             "pub_date": item.get("pubDate"),
         }
         for index in anchor_indices
-        for item in [ordered[index]]
+        for item in [distinct_items[index]]
     ]
     return {
         "returned_count": len(items),
@@ -1190,7 +1425,7 @@ def preview_coverage(value: Any) -> dict[str, Any]:
             "no-items"
             if not items
             else "insufficient-samples"
-            if len(episode_values) < 3
+            if len(unique_episodes) < 3
             else "observed-range"
         ),
         "full_feed_verified": False,
@@ -1482,6 +1717,7 @@ def preflight_duplicate_check(
     api_key: str,
     expected: dict[str, Any],
     timeout: int,
+    *, distinct_feed_reason: str | None = None,
 ) -> dict[str, Any]:
     response = request_json(base_url, api_key, "POST", "/api/listAni", timeout=timeout)
     subscriptions = flatten_subscriptions(unwrap_data(response))
@@ -1492,7 +1728,14 @@ def preflight_duplicate_check(
         raise AniRssError(
             "A matching subscription already exists; review list/get and use set for edits."
         )
-    return {"checked": True, "matching_subscriptions": 0}
+    same_content = [item for item in subscriptions
+                    if tmdb_id_from_ani(expected) and tmdb_id_from_ani(item) == tmdb_id_from_ani(expected)
+                    and is_tv_ani(item) == is_tv_ani(expected) and item.get("season") == expected.get("season")]
+    if same_content and (not isinstance(distinct_feed_reason, str) or not distinct_feed_reason.strip()):
+        raise AniRssError("Same TMDB season is already subscribed with another RSS/group; review list/get. "
+                          "Use set for replacement, or --distinct-feed-reason only after the user confirms a distinct content range")
+    return {"checked": True, "matching_subscriptions": 0, "same_tmdb_season_count": len(same_content),
+            "distinct_feed_reason": distinct_feed_reason}
 
 
 def command_add(args: argparse.Namespace) -> None:
@@ -1508,7 +1751,8 @@ def command_add(args: argparse.Namespace) -> None:
         tmdb_lookup_path=getattr(args, "tmdb_lookup_evidence", None),
         tmdb_season_path=getattr(args, "tmdb_season_evidence", None),
     )
-    preflight = preflight_duplicate_check(base_url, api_key, ani, args.timeout)
+    preflight = preflight_duplicate_check(base_url, api_key, ani, args.timeout,
+                                          distinct_feed_reason=getattr(args, "distinct_feed_reason", None))
     response = request_json(
         base_url,
         api_key,
@@ -1586,6 +1830,10 @@ def add_season_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--season", help="Optional season label, e.g. 春, 夏, 秋, 冬")
 
 
+def add_source_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--source", choices=SOURCES, default="mikan")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="ANI-RSS helper for Mikan-first anime subscription planning."
@@ -1595,6 +1843,8 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="Read-only search plus group planning")
     add_common_args(plan)
     add_season_args(plan)
+    add_source_args(plan)
+    plan.add_argument("--bgm-url", help="Exact Bangumi subject for AniBT/AnimeGarden")
     plan.add_argument("title")
     plan.add_argument("--sample-limit", type=int, default=5)
     plan.set_defaults(func=command_plan)
@@ -1602,23 +1852,35 @@ def build_parser() -> argparse.ArgumentParser:
     search = subparsers.add_parser("search", help="Read-only Mikan search")
     add_common_args(search)
     add_season_args(search)
+    add_source_args(search)
+    search.add_argument("--bgm-url", help="Exact Bangumi subject for AniBT/AnimeGarden")
     search.add_argument("title")
     search.set_defaults(func=command_search)
 
-    groups = subparsers.add_parser("groups", help="Read-only Mikan group lookup")
+    groups = subparsers.add_parser("groups", help="Read-only source group lookup")
     add_common_args(groups)
-    groups.add_argument("--url", required=True, help="Mikan anime URL")
+    add_source_args(groups)
+    groups.add_argument("--url", help="Mikan anime URL")
+    groups.add_argument("--bgm-id", help="Bangumi subject id for AniBT/AnimeGarden")
     groups.add_argument("--sample-limit", type=int, default=5)
     groups.set_defaults(func=command_groups)
 
     build = subparsers.add_parser("build-from-rss", help="Convert RSS to Ani JSON")
     add_common_args(build)
     build.add_argument("--rss", required=True)
-    build.add_argument("--type", default="mikan")
+    build.add_argument("--type", choices=SOURCES, default="mikan")
+    build.add_argument("--options-evidence", required=True, help="Saved render-options result shown to the user")
+    build.add_argument("--option-id", required=True, help="Exact option_id selected by the user")
     build.add_argument("--bgm-url", required=True)
     build.add_argument("--subgroup", required=True)
     build.add_argument("--disabled", action="store_true", help="Create Ani disabled")
     build.set_defaults(func=command_build_from_rss)
+
+    render = subparsers.add_parser("render-options", help="Validate language/spec descriptions and render fixed candidate cards")
+    render.add_argument("--plan-json", required=True)
+    render.add_argument("--options-json", required=True)
+    render.add_argument("--result-file")
+    render.set_defaults(func=command_render_options)
 
     patch_cmd = subparsers.add_parser(
         "patch", help="Apply validated field changes to an Ani JSON object"
@@ -1698,6 +1960,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_args(add)
     add.add_argument("--ani-json", required=True, help="Ani JSON path or '-' for stdin")
     add.add_argument("--confirm-add", action="store_true")
+    add.add_argument("--distinct-feed-reason", help="User-confirmed distinct content range despite sharing a TMDB season")
     add_write_evidence_args(add)
     add.set_defaults(func=command_add)
 
