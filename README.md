@@ -177,7 +177,7 @@ python scripts/ani_rss.py tmdb-season --tmdb-id "<id>" --season-number <resolved
 
 `tmdb-lookup --title` 可以用于初步搜标题，但不能替代 `--tmdb-id` 的直接查询。直接 TMDB 查询要求本地配置 `TMDB_API_TOKEN` 或 `TMDB_API_KEY`。必须先读取 `tmdb-lookup` 返回的 `result.seasons`，再从真实存在的季号中选择 `<resolved-tmdb-season>`；RSS 的 `S3` 不能直接当成 TMDB Season 3。若 RSS 季号不在列表中，不要用 404 试探，改查列表中合理的候选季并按逐集范围对齐；最终 TV `season` 不在该列表时，写入会被拒绝。
 
-这些命令只返回 TMDB 原始证据。LLM 需要先确认标题、年份、类型和季度对应的是同一部作品，再读取 `result.seasons` 选择真实存在的 TMDB 季，判断 RSS 是季度内编号还是连续编号，并确认 TMDB 剧集组使用季内编号还是全局编号。公式是 `目标集数 = RSS解析集数 + offset`：例如 RSS `S3E01` 对应合并单季的 TMDB `S1E25` 时使用 `offset: 24`；如果 TMDB 有独立第四季，RSS `S4E11` 则使用 `season: 4, offset: 0`；只有全局 `E77` 映射到独立 `S4E11` 时才使用 `offset: -66`。必须用 preview 返回的实际解析集数验证至少两个样本；双编号标题如 `[11 - 总第77]` 还需用 `customEpisodeStr` 捕获 `11`。无法确认编号模式、TMDB 剧集组或已有订阅时，必须询问用户。
+这些命令只返回 TMDB 原始证据。LLM 需要先确认标题、年份、类型和季度对应的是同一部作品，再读取 `result.seasons` 选择真实存在的 TMDB 季，判断 RSS 是季度内编号还是连续编号，并确认 TMDB 剧集组使用季内编号还是全局编号。公式是 `目标集数 = RSS解析集数 + offset`：例如 RSS `S3E01` 对应合并单季的 TMDB `S1E25` 时使用 `offset: 24`；如果 TMDB 有独立第四季，RSS `S4E11` 则使用 `season: 4, offset: 0`；只有全局 `E77` 映射到独立 `S4E11` 时才使用 `offset: -66`。必须用 preview 返回的实际解析集数验证现有样本；只有一集时核对这一集并说明后续尚未验证，不要求凑够两个样本。双编号标题如 `[11 - 总第77]` 还需用 `customEpisodeStr` 捕获 `11`。无法确认编号模式、TMDB 剧集组或已有订阅时，必须询问用户。
 
 当标准 TMDB 季度无法解释 RSS 编号时，再额外查询剧集组：
 
@@ -196,7 +196,7 @@ python scripts/ani_rss.py preview `
   --result-file .ani-rss-runs/040-preview.json
 ```
 
-预览结果附带 `coverage`、`input_sha256`、`confirmation` 和固定格式的 `confirmation_text`。原样展示 `confirmation_text`，再解释映射与所选字幕版本；参数来自实际预览对象，不从先前推理重述。检查第一、中间、最后三个不同集数，并核对所有返回项的 offset。空预览和 TV 不足三个不同已解析集数不能提交；同一集不同版本不计作三个锚点。滚动 RSS 只证明已观测范围。
+预览结果附带 `coverage`、`input_sha256`、`confirmation` 和固定格式的 `confirmation_text`。原样展示 `confirmation_text`，再解释映射与所选字幕版本；参数来自实际预览对象，不从先前推理重述。核对全部可解析样本的 offset，多集时检查第一、中间、最后的不同集数。新番只有一集也可在真实查询 TMDB、核对映射并获得确认后提交，不要求凑够三集。同一集不同版本只计一个锚点。`coverage.warnings` 提示单集、未解析项和缺口；空预览或 TV 完全没有有效解析集数仍不能提交。滚动 RSS 只证明已观测范围，三集也不等于整季验证。
 
 最终添加订阅：
 

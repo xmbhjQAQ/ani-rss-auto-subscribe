@@ -8,6 +8,7 @@ import copy
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import re
 import sys
@@ -1063,10 +1064,7 @@ def validate_patch(patch: dict[str, Any]) -> dict[str, Any]:
 
     if "customEpisode" in patch and not isinstance(patch["customEpisode"], bool):
         raise AniRssError("customEpisode must be a boolean")
-    if "customEpisodeStr" in patch and (
-        not isinstance(patch["customEpisodeStr"], str)
-        or not patch["customEpisodeStr"].strip()
-    ):
+    if "customEpisodeStr" in patch and not isinstance(patch["customEpisodeStr"], str):
         raise AniRssError("customEpisodeStr must be a string")
     has_tmdb = "tmdb" in patch
     has_tmdb_name = "themoviedbName" in patch
@@ -1184,8 +1182,8 @@ def validate_write_evidence(
     coverage = preview_coverage(preview_evidence.get("preview"))
     if coverage["returned_count"] == 0:
         raise AniRssError("Preview contains no items; refusing to write an unverified RSS")
-    if is_tv_ani(ani) and coverage["coverage_status"] != "observed-range":
-        raise AniRssError("TV preview requires at least three distinct parsed episodes before writing")
+    if is_tv_ani(ani) and coverage["unique_episode_count"] == 0:
+        raise AniRssError("TV preview has no parsed episodes; resolve episode parsing before writing")
 
     tmdb_id = tmdb_id_from_ani(ani)
     if not tmdb_id:
@@ -1218,7 +1216,7 @@ def validate_write_evidence(
 
     season_evidence: dict[str, Any] | None = None
     if is_tv_ani(ani):
-        if "season" not in ani or not isinstance(ani.get("season"), int):
+        if not isinstance(ani.get("season"), int) or isinstance(ani.get("season"), bool):
             raise AniRssError(
                 "TV subscriptions require a final integer season before writing."
             )
@@ -1360,8 +1358,9 @@ def render_confirmation(ani: dict[str, Any], preview: Any) -> str:
         f"日期：{display(fields['releaseDate'])}\n总集数：{display(fields['totalEpisodeNumber'])}\n"
         f"匹配规则：{display(fields['match'])}\n排除规则：{display(fields['exclude'])}\n"
         f"备用RSS：{display(fields['standbyRssList'])}\n"
-        f"预览：{coverage['returned_count']}条资源，{coverage['unique_episode_count']}个不同已解析集数；仅验证已观测范围\n"
-        "请确认以上实际参数后再添加。"
+        f"预览：{coverage['returned_count']}条资源，{coverage['unique_episode_count']}个不同已解析集数；仅反映已观测范围\n"
+        + "".join(f"预览提示：{warning}\n" for warning in coverage["warnings"])
+        + "请确认以上实际参数后再添加。"
     )
 
 
@@ -1373,6 +1372,7 @@ def preview_coverage(value: Any) -> dict[str, Any]:
         for item in items
         if isinstance(item.get("episode"), (int, float))
         and not isinstance(item.get("episode"), bool)
+        and math.isfinite(item["episode"])
     ]
     episode_values: list[float] = []
     for item in parsed_items:
@@ -1411,6 +1411,13 @@ def preview_coverage(value: Any) -> dict[str, Any]:
         for index in anchor_indices
         for item in [distinct_items[index]]
     ]
+    warnings = []
+    if len(unique_episodes) == 1:
+        warnings.append("仅有一个不同已解析集数；可核对该集，但不能证明后续集数或整季映射。")
+    if len(items) != len(parsed_items):
+        warnings.append(f"{len(items) - len(parsed_items)}条资源没有有效集数，需检查是否为预告、合集或解析失败。")
+    if missing_episodes:
+        warnings.append("已观测集数之间存在缺口；不代表整个RSS缺集。")
     return {
         "returned_count": len(items),
         "parsed_episode_count": len(episode_values),
@@ -1424,11 +1431,12 @@ def preview_coverage(value: Any) -> dict[str, Any]:
         "coverage_status": (
             "no-items"
             if not items
-            else "insufficient-samples"
-            if len(unique_episodes) < 3
+            else "no-parsed-episodes"
+            if not unique_episodes
             else "observed-range"
         ),
         "full_feed_verified": False,
+        "warnings": warnings,
         "note": (
             "This describes returned preview items only. It does not prove that the RSS feed "
             "contains the complete season; inspect the source range separately."

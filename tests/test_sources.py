@@ -176,15 +176,43 @@ class SourceWorkflowTests(unittest.TestCase):
         }
         return patch.object(m, "read_evidence_file", side_effect=lambda path, label: records[path])
 
-    def test_empty_preview_and_three_versions_of_one_episode_cannot_authorize_write(self):
+    def test_empty_or_unparsed_tv_preview_cannot_authorize_write(self):
         ani = {"season": 1, "tmdb": {"id": "1", "tmdbType": "TV"}}
-        for items in ([], [{"episode": 1}] * 3):
+        for items in ([], [{"title": "unparsed"}], [{"episode": True}],
+                      [{"episode": float("nan")}], [{"episode": float("inf")}]):
             with self.subTest(items=items), self.evidence(ani, items):
                 with self.assertRaises(m.AniRssError):
                     m.validate_write_evidence(ani, preview_path="preview", tmdb_lookup_path="lookup", tmdb_season_path="season")
+
+    def test_one_two_and_duplicate_episode_versions_can_authorize_write(self):
+        ani = {"season": 1, "tmdb": {"id": "1", "tmdbType": "TV"}}
+        for items in ([{"episode": 1}], [{"episode": 1}, {"episode": 2}],
+                      [{"episode": 1}] * 3, [{"episode": 1}, {"title": "Trailer"}]):
+            with self.subTest(items=items), self.evidence(ani, items):
+                result = m.validate_write_evidence(ani, preview_path="preview", tmdb_lookup_path="lookup", tmdb_season_path="season")
+                self.assertEqual(m.json_sha256(ani), result["ani_sha256"])
         coverage = m.preview_coverage({"items": [{"episode": 1}] * 3})
-        self.assertEqual("insufficient-samples", coverage["coverage_status"])
+        self.assertEqual("observed-range", coverage["coverage_status"])
         self.assertEqual(1, len(coverage["anchors"]))
+        self.assertTrue(coverage["warnings"])
+        self.assertFalse(coverage["full_feed_verified"])
+
+    def test_single_episode_does_not_remove_tmdb_requirements(self):
+        ani = {"season": 1, "tmdb": {"id": "1", "tmdbType": "TV"}}
+        with self.evidence(ani, [{"episode": 1}]):
+            for lookup, season in ((None, "season"), ("lookup", None)):
+                with self.subTest(lookup=lookup, season=season), self.assertRaises(m.AniRssError):
+                    m.validate_write_evidence(ani, preview_path="preview", tmdb_lookup_path=lookup, tmdb_season_path=season)
+
+    def test_movie_preview_does_not_require_an_episode_number(self):
+        ani = {"tmdb": {"id": "1", "tmdbType": "movie"}}
+        with self.evidence(ani, [{"title": "Movie"}]):
+            m.validate_write_evidence(ani, preview_path="preview", tmdb_lookup_path="lookup", tmdb_season_path=None)
+
+    def test_boolean_season_is_not_an_integer_season(self):
+        ani = {"season": True, "tmdb": {"id": "1", "tmdbType": "TV"}}
+        with self.evidence(ani, [{"episode": 1}]), self.assertRaisesRegex(m.AniRssError, "integer season"):
+            m.validate_write_evidence(ani, preview_path="preview", tmdb_lookup_path="lookup", tmdb_season_path="season")
 
     def test_cross_source_duplicate_requires_distinct_range_and_exact_duplicate_still_blocks(self):
         ani = {"title": "Example", "season": 1, "url": "https://one.test/rss", "subgroup": "Group", "tmdb": {"id": "1"}}

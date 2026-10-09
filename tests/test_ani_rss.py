@@ -29,13 +29,13 @@ class AniAdapterTests(unittest.TestCase):
         self.addCleanup(path.unlink, missing_ok=True)
         return str(path)
 
-    def write_write_evidence(self, ani):
+    def write_write_evidence(self, ani, episodes=(1, 2, 3)):
         preview = self.write_json(
             {
                 "ok": True,
                 "command": "preview",
                 "input_sha256": ani_rss.json_sha256(ani),
-                "preview": {"items": [{"episode": number} for number in (1, 2, 3)]},
+                "preview": {"items": [{"episode": number} for number in episodes]},
             }
         )
         lookup = self.write_json(
@@ -169,6 +169,14 @@ class AniAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(ani_rss.AniRssError, "requires a non-empty"):
             ani_rss.apply_patch({}, {"customEpisode": True})
 
+    def test_disabled_custom_episode_allows_clearing_old_pattern(self):
+        ani = {"customEpisode": True, "customEpisodeStr": "([0-9]+)", "customEpisodeGroupIndex": 1}
+        result = ani_rss.apply_patch(ani, {"customEpisode": False, "customEpisodeStr": ""})
+        self.assertFalse(result["customEpisode"])
+        self.assertEqual("", result["customEpisodeStr"])
+        with self.assertRaisesRegex(ani_rss.AniRssError, "non-empty"):
+            ani_rss.apply_patch(ani, {"customEpisodeStr": ""})
+
     def test_patch_requires_a_complete_tmdb_identity(self):
         with self.assertRaisesRegex(ani_rss.AniRssError, "patched together"):
             ani_rss.validate_patch({"tmdb": {"id": "1"}})
@@ -279,7 +287,7 @@ class AniAdapterTests(unittest.TestCase):
         self.assertEqual(existing, json.loads(output.getvalue())["ani"])
 
         ani_path = self.write_json(existing)
-        preview, lookup, season = self.write_write_evidence(existing)
+        preview, lookup, season = self.write_write_evidence(existing, episodes=(1,))
         set_args = SimpleNamespace(
             confirm_set=True,
             move_files=False,
@@ -334,7 +342,7 @@ class AniAdapterTests(unittest.TestCase):
         self.assertEqual([1, 3, 5], [item["episode"] for item in coverage["anchors"]])
         self.assertFalse(coverage["full_feed_verified"])
 
-    def test_preview_coverage_requires_three_parsed_episodes(self):
+    def test_preview_coverage_single_episode_with_unparsed_items_warns(self):
         coverage = ani_rss.preview_coverage(
             {
                 "items": [
@@ -344,9 +352,11 @@ class AniAdapterTests(unittest.TestCase):
                 ]
             }
         )
-        self.assertEqual("insufficient-samples", coverage["coverage_status"])
+        self.assertEqual("observed-range", coverage["coverage_status"])
         self.assertEqual(1, coverage["parsed_episode_count"])
         self.assertEqual(2, coverage["unparsed_item_count"])
+        self.assertEqual(2, len(coverage["warnings"]))
+        self.assertFalse(coverage["full_feed_verified"])
 
     def test_add_requires_persistence_verification(self):
         ani = {
@@ -358,7 +368,7 @@ class AniAdapterTests(unittest.TestCase):
             "tmdb": {"id": "1", "name": "Example", "tmdbType": "TV"},
         }
         ani_path = self.write_json(ani)
-        preview, lookup, season = self.write_write_evidence(ani)
+        preview, lookup, season = self.write_write_evidence(ani, episodes=(1,))
         args = SimpleNamespace(
             confirm_add=True,
             ani_json=ani_path,
